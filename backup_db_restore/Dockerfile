@@ -1,7 +1,7 @@
 FROM ghcr.io/home-assistant/base:latest
 
 ARG BUILD_ARCH=amd64
-ARG BUILD_VERSION=0.5.5
+ARG BUILD_VERSION=0.5.6
 
 LABEL \
     io.hass.name="Backup DB Restore" \

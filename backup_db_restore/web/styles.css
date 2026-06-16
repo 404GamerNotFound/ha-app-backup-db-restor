@@ -223,6 +223,19 @@ h3 {
   color: var(--muted);
 }
 
+.recovery-panel {
+  gap: 10px;
+}
+
+.recovery-toolbar {
+  margin-bottom: 0;
+}
+
+.recovery-toolbar select {
+  flex: 1 1 520px;
+  min-width: min(100%, 520px);
+}
+
 .progress-panel {
   background: var(--panel);
   border: 1px solid var(--line);

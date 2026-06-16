@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.6
+
+- Lokale Home-Assistant-Corrupt-Dateien im Verzeichnis der konfigurierten
+  Recorder-DB werden erkannt, z. B.
+  `home-assistant_v2.db.corrupt.<timestamp>`.
+- Passende `-wal.corrupt.<timestamp>`, `-shm.corrupt.<timestamp>` und
+  `-journal.corrupt.<timestamp>` Sidecars werden beim Laden eines
+  Rettungskandidaten mit in den Quell-Cache kopiert.
+- Corrupt-DBs koennen im Tab `Backup & Import` ueber `Defekte Recorder-DBs`
+  als Quelle geladen werden. Danach greifen die bestehende Entitaetenliste,
+  Vorabpruefung, History-Import und Long-Term-Statistics-Import wie bei einem
+  Backup.
+- Die Quell-Statuskarte heisst nun `Geladene Quell-DB` und zeigt, ob die
+  Quelle aus Upload, Backup oder defekter DB stammt.
+- Wenn die Sidecars das Lesen verhindern, versucht die App automatisch einen
+  Fallback nur mit der Hauptdatenbank.
+- Beim Leeren oder Ersetzen des Quell-Caches werden auch alte
+  `source.db-wal`, `source.db-shm` und `source.db-journal` Dateien entfernt.
+
 ## 0.5.5
 
 - UI in zwei Arbeitsbereiche geteilt: `Aktuelle DB-Analyse` fuer die bestehende

@@ -106,9 +106,21 @@
           <button id="nextBackupPageButton" class="secondary small" type="button">Weiter</button>
         </section>
 
+        <section class="panel compact-panel recovery-panel" aria-label="Defekte Datenbanken">
+          <div class="panel-header">
+            <h2>Defekte Recorder-DBs</h2>
+            <button id="refreshCorruptDatabasesButton" class="secondary small" type="button">Aktualisieren</button>
+          </div>
+          <div class="toolbar recovery-toolbar">
+            <select id="corruptDatabaseSelect" aria-label="Defekte Recorder-Datenbank"></select>
+            <button id="loadCorruptDatabaseButton" type="button">Zur Rettung laden</button>
+          </div>
+          <span id="corruptDatabaseInfo" class="muted-line"></span>
+        </section>
+
         <section class="status-grid" aria-label="Backup Datenbank">
           <article class="status-box">
-            <span class="status-label">Hochgeladene DB</span>
+            <span class="status-label">Geladene Quell-DB</span>
             <strong id="sourceHealth">Keine Datei</strong>
             <span id="sourceDetails"></span>
           </article>

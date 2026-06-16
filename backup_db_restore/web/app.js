@@ -2,6 +2,8 @@ const state = {
   sourceEntities: [],
   currentEntities: [],
   deviceBackups: [],
+  corruptDatabases: [],
+  corruptDatabaseTotal: 0,
   currentDbBackups: [],
   reports: [],
   sourcePage: {
@@ -93,6 +95,8 @@ function setBusy(isBusy) {
     "clearCacheButton",
     "refreshBackupsButton",
     "loadBackupButton",
+    "refreshCorruptDatabasesButton",
+    "loadCorruptDatabaseButton",
     "previewButton",
     "importButton",
     "restoreDbButton",
@@ -269,6 +273,12 @@ function renderStatus() {
   $("currentDbPath").textContent = status.options.database_path;
 
   const source = status.cache.analysis;
+  const sourceKindLabels = {
+    upload: "Upload",
+    device_backup: "Backup",
+    corrupt_database: "Defekte DB",
+  };
+  const sourceKind = sourceKindLabels[status.cache.meta?.source_kind] || "Quelle";
   if (source && source.exists) {
     if (source.partial || (!source.ok && source.readable)) {
       $("sourceHealth").textContent = "Teilweise lesbar";
@@ -277,7 +287,7 @@ function renderStatus() {
       setHealth($("sourceHealth"), Boolean(source.ok));
     }
     const warnings = source.read_errors?.length ? ` / ${source.read_errors.length} Warnung(en)` : "";
-    $("sourceDetails").textContent = `${formatBytes(source.size_bytes)} / ${source.states_count || 0} States / ${source.statistics_count || 0} LTS${warnings}`;
+    $("sourceDetails").textContent = `${sourceKind} / ${formatBytes(source.size_bytes)} / ${source.states_count || 0} States / ${source.statistics_count || 0} LTS${warnings}`;
   } else {
     $("sourceHealth").textContent = "Keine Datei";
     $("sourceHealth").className = "muted";
@@ -389,6 +399,23 @@ function renderDeviceBackups() {
   $("nextBackupPageButton").disabled = page.offset + page.limit >= page.total;
 }
 
+function renderCorruptDatabases() {
+  const select = $("corruptDatabaseSelect");
+  select.innerHTML = state.corruptDatabases
+    .map((file) => {
+      const sidecars = file.sidecar_count ? `, ${file.sidecar_count} Sidecar` : ", keine Sidecars";
+      const readable = file.sqlite_header ? "SQLite" : "kein SQLite-Header";
+      const label = `${file.relative_path} (${formatBytes(file.size_bytes)}${sidecars}, ${readable}, ${formatDate(file.modified)})`;
+      return `<option value="${escapeHtml(file.id)}">${escapeHtml(label)}</option>`;
+    })
+    .join("");
+  const total = Number(state.corruptDatabaseTotal || 0);
+  $("corruptDatabaseInfo").textContent = total
+    ? `${total} defekte Recorder-DB(s) gefunden`
+    : "Keine *.corrupt Recorder-DB im aktuellen DB-Verzeichnis gefunden";
+  $("loadCorruptDatabaseButton").disabled = !state.corruptDatabases.length;
+}
+
 function renderCurrentDbBackups() {
   $("currentDbBackupSelect").innerHTML = state.currentDbBackups
     .map((file) => {
@@ -471,6 +498,20 @@ async function refreshBackups() {
   }
 }
 
+async function refreshCorruptDatabases() {
+  try {
+    appendLog("Defekte Recorder-DBs werden gesucht.");
+    const payload = await api("api/corrupt-databases?limit=100");
+    state.corruptDatabases = payload.files || [];
+    state.corruptDatabaseTotal = payload.total || 0;
+    renderCorruptDatabases();
+    appendLog(`${state.corruptDatabaseTotal} defekte Recorder-DB(s) gefunden.`);
+  } catch (error) {
+    appendLog(`Fehler beim Suchen defekter DBs: ${error.message}`);
+    toast(error.message, "error");
+  }
+}
+
 async function refreshCurrentDbBackups() {
   const payload = await api("api/current-db-backups?limit=100");
   state.currentDbBackups = payload.files || [];
@@ -538,6 +579,32 @@ async function loadDeviceBackup() {
     state.sourcePage.offset = 0;
     await refreshStatus();
     toast("Backup analysiert und zwischengespeichert", "success");
+  } catch (error) {
+    setProgress(0, "Fehler");
+    appendLog(`Fehler: ${error.message}`);
+    toast(error.message, "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function loadCorruptDatabase() {
+  const fileId = $("corruptDatabaseSelect").value;
+  if (!fileId) {
+    toast("Keine defekte Recorder-DB ausgewaehlt", "warn");
+    return;
+  }
+
+  setBusy(true);
+  clearOperationLog();
+  setProgress(5, "Rettungs-Job startet");
+  try {
+    const job = await startJob({ action: "load_corrupt_database", file_id: fileId });
+    await waitForJob(job);
+    state.sourcePage.offset = 0;
+    await refreshStatus();
+    setActiveTab("import");
+    toast("Defekte DB als Quelle geladen. Entitaeten koennen jetzt importiert werden.", "success");
   } catch (error) {
     setProgress(0, "Fehler");
     appendLog(`Fehler: ${error.message}`);
@@ -793,6 +860,8 @@ function bindEvents() {
   $("clearCacheButton").addEventListener("click", clearCache);
   $("refreshBackupsButton").addEventListener("click", refreshBackups);
   $("loadBackupButton").addEventListener("click", loadDeviceBackup);
+  $("refreshCorruptDatabasesButton").addEventListener("click", refreshCorruptDatabases);
+  $("loadCorruptDatabaseButton").addEventListener("click", loadCorruptDatabase);
   $("refreshDbBackupsButton").addEventListener("click", () => refreshCurrentDbBackups().catch((error) => toast(error.message, "error")));
   $("restoreDbButton").addEventListener("click", restoreCurrentDb);
   $("refreshReportsButton").addEventListener("click", () => refreshReports().catch((error) => toast(error.message, "error")));
@@ -852,4 +921,5 @@ function bindEvents() {
 setActiveTab(window.location.hash === "#import" ? "import" : "analysis", false);
 bindEvents();
 refreshBackups();
+refreshCorruptDatabases();
 refreshStatus().catch((error) => toast(error.message, "error"));

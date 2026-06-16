@@ -1151,6 +1151,21 @@ def supported_backup_file(path: Path) -> bool:
     return normalized.endswith(BACKUP_FILE_EXTENSIONS)
 
 
+def source_database_sidecar_paths() -> tuple[Path, Path, Path]:
+    return (Path(f"{SOURCE_DB}-wal"), Path(f"{SOURCE_DB}-shm"), Path(f"{SOURCE_DB}-journal"))
+
+
+def cleanup_source_database_files(include_meta: bool = False) -> None:
+    paths = [SOURCE_DB, *source_database_sidecar_paths()]
+    if include_meta:
+        paths.extend([SOURCE_ORIGINAL, SOURCE_META])
+    for path in paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def paginate_items(items: list[dict[str, Any]], offset: int, limit: int) -> dict[str, Any]:
     total = len(items)
     bounded_limit = max(10, min(limit, 500))
@@ -1232,6 +1247,130 @@ def resolve_device_backup(file_id: str) -> Path:
         raise AppError("Selected backup file does not exist.")
     if not supported_backup_file(path):
         raise AppError("Selected file is not a supported backup or SQLite file.")
+    return path
+
+
+def recovery_root() -> Path:
+    options = read_options()
+    current_db = Path(str(options["database_path"]))
+    return current_db.parent
+
+
+def corrupt_marker_parts(path: Path) -> tuple[str, str] | None:
+    name = path.name
+    marker = ".corrupt"
+    marker_index = name.lower().find(marker)
+    if marker_index < 0:
+        return None
+    return name[:marker_index], name[marker_index + len(marker):]
+
+
+def is_corrupt_database_file(path: Path) -> bool:
+    parts = corrupt_marker_parts(path)
+    if not parts:
+        return False
+    base_name, _ = parts
+    normalized_base = base_name.lower()
+    if normalized_base.endswith(("-wal", "-shm", "-journal")):
+        return False
+    return normalized_base.endswith((".db", ".sqlite", ".sqlite3"))
+
+
+def matching_corrupt_sidecars(path: Path) -> dict[str, Path]:
+    parts = corrupt_marker_parts(path)
+    if not parts:
+        return {}
+    base_name, suffix = parts
+    sidecars: dict[str, Path] = {}
+    for kind in ("wal", "shm", "journal"):
+        candidates = [
+            path.parent / f"{base_name}-{kind}.corrupt{suffix}",
+            path.parent / f"{base_name}-{kind}",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                sidecars[kind] = candidate
+                break
+    return sidecars
+
+
+def list_corrupt_databases(offset: int = 0, limit: int = 100, filter_text: str = "") -> dict[str, Any]:
+    files: list[dict[str, Any]] = []
+    root = recovery_root()
+    if not root.exists():
+        return {
+            "config_dir": str(root),
+            "exists": False,
+            "files": files,
+            "offset": 0,
+            "limit": limit,
+            "total": 0,
+            "has_next": False,
+            "has_previous": False,
+            "filter": filter_text,
+        }
+
+    root_resolved = root.resolve()
+    normalized_filter = filter_text.strip().lower()
+    for path in root.glob("*corrupt*"):
+        if not path.is_file() or not is_corrupt_database_file(path):
+            continue
+        try:
+            resolved = path.resolve()
+            relative_path = resolved.relative_to(root_resolved).as_posix()
+            stat = path.stat()
+        except (OSError, ValueError):
+            continue
+        if normalized_filter and normalized_filter not in relative_path.lower() and normalized_filter not in path.name.lower():
+            continue
+        sidecars = {
+            kind: file_info(sidecar)
+            for kind, sidecar in matching_corrupt_sidecars(path).items()
+        }
+        files.append(
+            {
+                "id": relative_path,
+                "name": path.name,
+                "relative_path": relative_path,
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
+                "sqlite_header": is_sqlite_file(path),
+                "sidecars": sidecars,
+                "sidecar_count": len(sidecars),
+                "sidecar_size_bytes": sum(int(info.get("size_bytes") or 0) for info in sidecars.values()),
+            }
+        )
+
+    files.sort(key=lambda item: (item["modified"], item["relative_path"]), reverse=True)
+    page = paginate_items(files, offset, limit)
+    return {
+        "config_dir": str(root),
+        "exists": True,
+        "files": page["items"],
+        "offset": page["offset"],
+        "limit": page["limit"],
+        "total": page["total"],
+        "has_next": page["has_next"],
+        "has_previous": page["has_previous"],
+        "filter": filter_text,
+    }
+
+
+def resolve_corrupt_database(file_id: str) -> Path:
+    if not file_id:
+        raise AppError("No corrupt database was selected.")
+    root = recovery_root().resolve()
+    path = (root / file_id).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as err:
+        raise AppError("Corrupt database path is outside the configured database directory.") from err
+    if not path.is_file():
+        raise AppError("Selected corrupt database does not exist.")
+    if not is_corrupt_database_file(path):
+        raise AppError("Selected file is not a supported corrupt Recorder database.")
+    if not is_sqlite_file(path):
+        raise AppError("Selected corrupt database has no SQLite header.")
     return path
 
 
@@ -1352,6 +1491,7 @@ def cache_source_file(
     if not analysis["sqlite_header"]:
         raise AppError("The extracted file is not a SQLite database.")
 
+    cleanup_source_database_files()
     if copy_original:
         shutil.copy2(source_path, SOURCE_ORIGINAL)
     else:
@@ -1377,6 +1517,67 @@ def cache_source_file(
     }
     write_source_meta(meta)
 
+    return {"meta": meta, "entities": entities}
+
+
+def copy_recovery_sidecars(source_path: Path) -> dict[str, dict[str, Any]]:
+    copied: dict[str, dict[str, Any]] = {}
+    destinations = {
+        "wal": Path(f"{SOURCE_DB}-wal"),
+        "shm": Path(f"{SOURCE_DB}-shm"),
+        "journal": Path(f"{SOURCE_DB}-journal"),
+    }
+    for kind, sidecar in matching_corrupt_sidecars(source_path).items():
+        destination = destinations[kind]
+        shutil.copy2(sidecar, destination)
+        copied[kind] = {
+            "source": str(sidecar),
+            "destination": str(destination),
+            "size_bytes": destination.stat().st_size,
+        }
+    return copied
+
+
+def remove_source_sidecars() -> None:
+    for path in source_database_sidecar_paths():
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def cache_corrupt_database(file_id: str) -> dict[str, Any]:
+    source_path = resolve_corrupt_database(file_id)
+    cleanup_source_database_files(include_meta=True)
+    shutil.copy2(source_path, SOURCE_DB)
+    copied_sidecars = copy_recovery_sidecars(source_path)
+
+    analysis = analyze_database(SOURCE_DB)
+    warnings: list[str] = []
+    used_sidecars = copied_sidecars
+    if copied_sidecars and not analysis.get("readable", False):
+        warnings.append("Quelle war mit WAL/SHM-Sidecars nicht lesbar. Es wurde automatisch ohne Sidecars erneut versucht.")
+        remove_source_sidecars()
+        used_sidecars = {}
+        analysis = analyze_database(SOURCE_DB)
+
+    if not analysis["sqlite_header"]:
+        raise AppError("Selected corrupt database is not a SQLite database.")
+    if not analysis.get("readable", analysis.get("ok", False)):
+        raise AppError(analysis.get("error") or "Selected corrupt database is not readable enough for rescue.")
+
+    entities = list_entities(SOURCE_DB, limit=None)
+    meta = {
+        "cached_at": now_iso(),
+        "source_kind": "corrupt_database",
+        "original_name": source_path.name,
+        "original_path": str(source_path),
+        "recovery_sidecars": used_sidecars,
+        "recovery_warnings": warnings,
+        "analysis": analysis,
+        "entities_count": len(entities),
+    }
+    write_source_meta(meta)
     return {"meta": meta, "entities": entities}
 
 
@@ -2446,6 +2647,20 @@ def job_cache_device_backup(job_id: str, file_id: str) -> dict[str, Any]:
     return result
 
 
+def job_cache_corrupt_database(job_id: str, file_id: str) -> dict[str, Any]:
+    update_job(job_id, progress=10, message=f"Defekte Recorder-DB wird zur Rettung geladen: {file_id}")
+    result = cache_corrupt_database(file_id)
+    meta = result.get("meta") or {}
+    sidecars = meta.get("recovery_sidecars") or {}
+    if sidecars:
+        update_job(job_id, progress=70, message=f"{len(sidecars)} passende WAL/SHM-Sidecar-Datei(en) wurden mitgeladen.")
+    if meta.get("recovery_warnings"):
+        for warning in meta["recovery_warnings"]:
+            update_job(job_id, progress=75, message=str(warning))
+    update_job(job_id, progress=85, message="Defekte Recorder-DB analysiert und als Quelle zwischengespeichert.")
+    return result
+
+
 def job_refresh_cached_database(job_id: str) -> dict[str, Any]:
     if not SOURCE_DB.exists():
         raise AppError("No cached database is available.")
@@ -2495,6 +2710,9 @@ def create_action_job(payload: dict[str, Any]) -> dict[str, Any]:
     if action == "load_backup":
         file_id = str(payload.get("file_id", "")).strip()
         return start_job("load_backup", "Backup laden", job_cache_device_backup, file_id)
+    if action == "load_corrupt_database":
+        file_id = str(payload.get("file_id", "")).strip()
+        return start_job("load_corrupt_database", "Defekte DB zur Rettung laden", job_cache_corrupt_database, file_id)
     if action == "refresh_cache":
         return start_job("refresh_cache", "Cache aktualisieren", job_refresh_cached_database)
     if action == "import":
@@ -2517,11 +2735,7 @@ def create_action_job(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def clear_cache() -> dict[str, Any]:
-    for path in (SOURCE_DB, SOURCE_ORIGINAL, SOURCE_META):
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+    cleanup_source_database_files(include_meta=True)
     return cache_status()
 
 
@@ -2561,7 +2775,7 @@ def paginated_source_entities(query: dict[str, list[str]]) -> dict[str, Any]:
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "BackupDbRestore/0.5.5"
+    server_version = "BackupDbRestore/0.5.6"
 
     def do_GET(self) -> None:
         try:
@@ -2585,6 +2799,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/backups":
                 self.send_json(
                     list_device_backups(
+                        offset=query_int(query, "offset", 0),
+                        limit=query_int(query, "limit", 100),
+                        filter_text=query.get("filter", [""])[0],
+                    )
+                )
+            elif path == "/api/corrupt-databases":
+                self.send_json(
+                    list_corrupt_databases(
                         offset=query_int(query, "offset", 0),
                         limit=query_int(query, "limit", 100),
                         filter_text=query.get("filter", [""])[0],
