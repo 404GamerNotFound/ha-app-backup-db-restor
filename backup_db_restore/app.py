@@ -983,9 +983,11 @@ def analyze_database_best_effort(path: Path) -> dict[str, Any]:
 
     if not path.exists():
         result["error"] = "Database file does not exist."
+        result["diagnostics"] = build_database_diagnostics(result)
         return result
     if not is_sqlite_file(path):
         result["error"] = "File is not a SQLite database."
+        result["diagnostics"] = build_database_diagnostics(result)
         return result
 
     result["sqlite_header"] = True
