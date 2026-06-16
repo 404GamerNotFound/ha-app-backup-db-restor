@@ -1986,24 +1986,22 @@ class HistoryImporter:
                 query_params,
             ).fetchone()[0]
         )
-        rows = source_conn.execute(
-            f"""
-            SELECT *
-            FROM {quote_identifier(table)}
-            WHERE {where_clause}
-            ORDER BY {quote_identifier(start_column)}
-            """,
-            query_params,
-        )
-
         scanned = 0
         inserted = 0
         skipped = 0
         replaced = 0
         first_imported = None
         last_imported = None
+        read_errors: list[str] = []
 
-        for source_row in rows:
+        source_sql = f"""
+            SELECT *
+            FROM {quote_identifier(table)}
+            WHERE {where_clause}
+            ORDER BY {quote_identifier(start_column)}
+            """
+
+        for source_row in query_rows_best_effort(source_conn, source_sql, query_params, read_errors, table):
             scanned += 1
             row_start = source_row[start_column]
             if target_metadata_id is not None and self.statistics_duplicate(target_conn, table, target_metadata_id, start_column, row_start):
@@ -2063,6 +2061,8 @@ class HistoryImporter:
             "inserted": inserted,
             "skipped": skipped,
             "replaced": replaced,
+            "read_errors": read_errors,
+            "partial": bool(read_errors),
             "first_imported": first_imported,
             "last_imported": last_imported,
         }
