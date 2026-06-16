@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.1
+
+- Best-Effort-Lesen fuer beschaedigte Quell-Datenbanken ergaenzt.
+- Integrity-Fehler oder Lesefehler einzelner Tabellen brechen Analyse, Cache und
+  Entity-Liste nicht mehr komplett ab, solange die SQLite-Datei grundsaetzlich
+  lesbar ist.
+- Entity- und Statistiklisten verwenden Metadaten-Tabellen als Fallback, wenn
+  aggregierte Scans ueber `states`, `statistics_short_term` oder `statistics`
+  fehlschlagen.
+- Import von lesbaren Bereichen ist weiterhin moeglich. Teilimporte enthalten
+  `partial`, `source_warnings` und `read_errors` im Ergebnis/Report.
+- UI zeigt lesbare, aber defekte Quellen als `Teilweise lesbar` mit Warnungszahl
+  statt als kompletten Abbruch an.
+
 ## 0.5.0
 
 - Serverseitige Job-API fuer Upload-Analyse, Backup-Laden, Cache-Refresh, Import

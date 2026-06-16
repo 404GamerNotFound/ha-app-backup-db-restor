@@ -300,6 +300,10 @@ h2 {
   color: var(--danger);
 }
 
+.warn {
+  color: var(--warn);
+}
+
 .muted {
   color: var(--muted);
 }

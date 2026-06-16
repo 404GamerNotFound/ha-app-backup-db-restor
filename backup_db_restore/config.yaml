@@ -1,6 +1,6 @@
 name: "Backup DB Restore"
 description: "Import Home Assistant recorder history from an uploaded backup database."
-version: "0.5.0"
+version: "0.5.1"
 slug: "backup_db_restore"
 stage: "experimental"
 init: false

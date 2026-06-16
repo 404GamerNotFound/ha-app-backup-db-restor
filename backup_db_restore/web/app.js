@@ -202,8 +202,14 @@ function renderStatus() {
 
   const source = status.cache.analysis;
   if (source && source.exists) {
-    setHealth($("sourceHealth"), Boolean(source.ok));
-    $("sourceDetails").textContent = `${formatBytes(source.size_bytes)} / ${source.states_count || 0} States / ${source.statistics_count || 0} LTS`;
+    if (source.partial || (!source.ok && source.readable)) {
+      $("sourceHealth").textContent = "Teilweise lesbar";
+      $("sourceHealth").className = "warn";
+    } else {
+      setHealth($("sourceHealth"), Boolean(source.ok));
+    }
+    const warnings = source.read_errors?.length ? ` / ${source.read_errors.length} Warnung(en)` : "";
+    $("sourceDetails").textContent = `${formatBytes(source.size_bytes)} / ${source.states_count || 0} States / ${source.statistics_count || 0} LTS${warnings}`;
   } else {
     $("sourceHealth").textContent = "Keine Datei";
     $("sourceHealth").className = "muted";
@@ -212,8 +218,14 @@ function renderStatus() {
 
   const target = status.current_database;
   if (target && target.exists) {
-    setHealth($("targetHealth"), Boolean(target.ok));
-    $("targetDetails").textContent = `${formatBytes(target.size_bytes)} / ${target.states_count || 0} States / ${target.statistics_count || 0} LTS`;
+    if (target.partial || (!target.ok && target.readable)) {
+      $("targetHealth").textContent = "Teilweise lesbar";
+      $("targetHealth").className = "warn";
+    } else {
+      setHealth($("targetHealth"), Boolean(target.ok));
+    }
+    const warnings = target.read_errors?.length ? ` / ${target.read_errors.length} Warnung(en)` : "";
+    $("targetDetails").textContent = `${formatBytes(target.size_bytes)} / ${target.states_count || 0} States / ${target.statistics_count || 0} LTS${warnings}`;
   } else {
     $("targetHealth").textContent = "Nicht gefunden";
     $("targetHealth").className = "bad";
@@ -561,8 +573,14 @@ async function runImport() {
     const result = await waitForJob(job);
     $("importResult").textContent = JSON.stringify(result, null, 2);
     appendLog(`States: ${result.inserted} neu, ${result.skipped} uebersprungen, ${result.replaced || 0} ersetzt, ${result.scanned} geprueft.`);
+    if (result.partial || result.read_errors?.length || result.source_warnings?.length) {
+      appendLog("Teilimport: Die Quelle hatte Lesewarnungen. Details stehen im JSON-Ergebnis/Report.");
+    }
     if (result.statistics) {
       appendLog(`Statistik: ${result.statistics.inserted} neu, ${result.statistics.skipped} uebersprungen, ${result.statistics.replaced || 0} ersetzt.`);
+      if (result.statistics.partial || result.statistics.read_errors?.length) {
+        appendLog("Teilimport Statistik: Einige Statistikbereiche waren nicht lesbar.");
+      }
     }
     await refreshStatus();
     toast("Import abgeschlossen", "success");
