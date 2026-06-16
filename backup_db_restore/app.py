@@ -1916,6 +1916,7 @@ class HistoryImporter:
         total_inserted = 0
         total_skipped = 0
         total_replaced = 0
+        read_errors: list[str] = []
 
         for table in STATISTICS_TABLES:
             table_result = self.copy_statistics_table(
@@ -1930,6 +1931,7 @@ class HistoryImporter:
             total_inserted += table_result["inserted"]
             total_skipped += table_result["skipped"]
             total_replaced += table_result.get("replaced", 0)
+            read_errors.extend(table_result.get("read_errors") or [])
 
         return {
             "enabled": True,
@@ -1939,6 +1941,8 @@ class HistoryImporter:
             "inserted": total_inserted,
             "skipped": total_skipped,
             "replaced": total_replaced,
+            "read_errors": read_errors,
+            "partial": bool(read_errors),
         }
 
     def copy_statistics_table(
