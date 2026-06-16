@@ -1,0 +1,13 @@
+configuration:
+  log_level:
+    name: "Log-Level"
+    description: "Steuert die Ausfuehrlichkeit der App-Logs."
+  database_path:
+    name: "Datenbankpfad"
+    description: "Pfad zur Home-Assistant-Datenbank im Container."
+  max_upload_mb:
+    name: "Maximale Uploadgroesse"
+    description: "Maximale Dateigroesse fuer DB- oder Backup-Uploads in MB."
+  create_current_db_backup:
+    name: "Aktuelle DB sichern"
+    description: "Erstellt vor einem Schreibimport eine SQLite-Sicherung der aktuellen Datenbank."

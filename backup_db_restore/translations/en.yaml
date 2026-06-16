@@ -1,0 +1,13 @@
+configuration:
+  log_level:
+    name: "Log level"
+    description: "Controls how verbose the app logs are."
+  database_path:
+    name: "Database path"
+    description: "Path to the Home Assistant database inside the container."
+  max_upload_mb:
+    name: "Maximum upload size"
+    description: "Maximum file size for database or backup uploads in MB."
+  create_current_db_backup:
+    name: "Back up current DB"
+    description: "Creates a SQLite backup of the current database before a write import."
