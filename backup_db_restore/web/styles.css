@@ -117,6 +117,7 @@ button.small {
 
 h1,
 h2,
+h3,
 p {
   margin: 0;
 }
@@ -128,6 +129,12 @@ h1 {
 
 h2 {
   font-size: 16px;
+}
+
+h3 {
+  color: var(--muted);
+  font-size: 13px;
+  text-transform: uppercase;
 }
 
 .topbar p {
@@ -266,6 +273,61 @@ h2 {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
   margin-bottom: 16px;
+}
+
+.diagnostics-panel {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.diagnostics-list {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+
+.diagnostics-list li {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+}
+
+.diagnostics-list strong {
+  font-size: 13px;
+}
+
+.diagnostics-list span {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.diagnostics-list .severity-error strong {
+  color: var(--danger);
+}
+
+.diagnostics-list .severity-warning strong {
+  color: var(--warn);
+}
+
+.diagnostics-list .severity-info strong {
+  color: var(--accent);
+}
+
+.diagnostics-panel pre {
+  min-height: 100px;
+  max-height: 220px;
 }
 
 .status-box,
@@ -539,6 +601,7 @@ pre {
   }
 
   .status-grid,
+  .diagnostics-grid,
   .management-grid,
   .split-layout {
     grid-template-columns: 1fr;

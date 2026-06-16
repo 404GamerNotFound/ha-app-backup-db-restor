@@ -30,6 +30,7 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 TMP_DIR = DATA_DIR / "tmp"
 CURRENT_DB_BACKUP_DIR = DATA_DIR / "current-db-backups"
 REPORT_DIR = DATA_DIR / "import-reports"
+DIAGNOSTIC_DIR = DATA_DIR / "diagnostics"
 
 OPTIONS_PATH = DATA_DIR / "options.json"
 SOURCE_DB = CACHE_DIR / "source.db"
@@ -170,7 +171,7 @@ def run_job(job_id: str, worker: Any, args: tuple[Any, ...]) -> None:
 
 
 def ensure_dirs() -> None:
-    for path in (CACHE_DIR, UPLOAD_DIR, TMP_DIR, CURRENT_DB_BACKUP_DIR, REPORT_DIR):
+    for path in (CACHE_DIR, UPLOAD_DIR, TMP_DIR, CURRENT_DB_BACKUP_DIR, REPORT_DIR, DIAGNOSTIC_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -272,6 +273,120 @@ def is_sqlite_file(path: Path) -> bool:
         return False
 
 
+def file_info(path: Path) -> dict[str, Any]:
+    try:
+        stat = path.stat()
+    except OSError as err:
+        return {"path": str(path), "exists": False, "error": str(err)}
+    return {
+        "path": str(path),
+        "exists": True,
+        "size_bytes": stat.st_size,
+        "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
+        "readable": os.access(path, os.R_OK),
+        "writable": os.access(path, os.W_OK),
+    }
+
+
+def database_sidecar_files(path: Path) -> dict[str, dict[str, Any]]:
+    return {
+        "wal": file_info(Path(f"{path}-wal")),
+        "shm": file_info(Path(f"{path}-shm")),
+        "journal": file_info(Path(f"{path}-journal")),
+    }
+
+
+def read_pragma(conn: sqlite3.Connection, pragma: str) -> Any:
+    row = conn.execute(f"PRAGMA {pragma}").fetchone()
+    if row is None:
+        return None
+    if len(row.keys()) == 1:
+        return row[0]
+    return dict(row)
+
+
+def build_database_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    problems: list[dict[str, Any]] = []
+    recommendations: list[dict[str, Any]] = []
+    actions: list[str] = ["reanalyze", "snapshot"]
+    sidecars = result.get("sidecars") or {}
+    wal = sidecars.get("wal") or {}
+    shm = sidecars.get("shm") or {}
+
+    def add_problem(severity: str, title: str, detail: str) -> None:
+        problems.append({"severity": severity, "title": title, "detail": detail})
+
+    def add_recommendation(title: str, detail: str, action: str | None = None) -> None:
+        item = {"title": title, "detail": detail}
+        if action:
+            item["action"] = action
+        recommendations.append(item)
+
+    if not result.get("exists"):
+        add_problem("error", "Datei nicht gefunden", "Der konfigurierte Datenbankpfad existiert nicht.")
+        add_recommendation("Pfad pruefen", "Pruefe die Add-on-Option database_path und den Mount /homeassistant_config.")
+        return {"problems": problems, "recommendations": recommendations, "actions": actions}
+
+    if not result.get("sqlite_header"):
+        add_problem("error", "Keine SQLite-Datei", "Die Datei hat keinen gueltigen SQLite-Header.")
+        add_recommendation("Richtige Recorder-DB waehlen", "Der Pfad sollte normalerweise auf home-assistant_v2.db zeigen.")
+        return {"problems": problems, "recommendations": recommendations, "actions": actions}
+
+    if not result.get("readable"):
+        add_problem("error", "SQLite nicht lesbar", result.get("error") or "Die Datei konnte nicht als SQLite-Datenbank geoeffnet werden.")
+        add_recommendation("Berechtigungen und Locks pruefen", "Pruefe, ob Home Assistant oder das Betriebssystem den Zugriff blockiert.")
+
+    integrity = [entry for entry in result.get("integrity", []) if entry != "ok"]
+    for entry in integrity[:8]:
+        add_problem("error", "Integrity-Check meldet Fehler", str(entry))
+    if len(integrity) > 8:
+        add_problem("error", "Weitere Integrity-Fehler", f"{len(integrity) - 8} weitere Meldung(en) wurden gekuerzt.")
+
+    if result.get("read_errors"):
+        for entry in result["read_errors"][:8]:
+            add_problem("warning", "Lesewarnung", str(entry))
+
+    if result.get("foreign_key_errors"):
+        add_problem("warning", "Foreign-Key-Warnungen", f"{len(result['foreign_key_errors'])} Foreign-Key-Problem(e) gefunden.")
+
+    tables = set(result.get("tables") or [])
+    if result.get("readable") and "states" not in tables:
+        add_problem("warning", "States-Tabelle fehlt", "Die Recorder-Tabelle states wurde nicht gefunden.")
+    if result.get("readable") and result.get("states_count", 0) == 0:
+        add_problem("warning", "Keine State-History gefunden", "Die Datenbank ist lesbar, enthaelt aber keine State-Zeilen.")
+
+    if wal.get("exists") and wal.get("size_bytes", 0) > 0:
+        add_problem("info", "WAL-Datei vorhanden", f"{wal.get('size_bytes')} Byte liegen in der Write-Ahead-Log-Datei.")
+        if not shm.get("exists"):
+            add_problem("warning", "SHM-Datei fehlt", "Zur WAL-Datei wurde keine passende -shm-Datei gefunden.")
+        add_recommendation(
+            "Passiven WAL-Checkpoint versuchen",
+            "Wenn die DB nur wegen ausstehender WAL-Daten auffaellig ist, kann ein passiver Checkpoint helfen. Das blockiert Schreibzugriffe nicht aggressiv.",
+            "checkpoint",
+        )
+        if "checkpoint" not in actions:
+            actions.append("checkpoint")
+
+    if result.get("ok"):
+        add_recommendation("Keine Reparatur noetig", "Der SQLite-Integrity-Check ist ok.")
+    else:
+        add_recommendation(
+            "Konsistente Sicherung/Snapshot erstellen",
+            "Erstellt mit SQLite Backup API eine neue Sicherung der aktuellen DB und analysiert diese separat.",
+            "snapshot",
+        )
+        add_recommendation(
+            "Home Assistant neu starten",
+            "Nach externen DB-Aktionen oder bei Recorder-Locks kann ein Neustart den Recorder-Zustand bereinigen.",
+        )
+        add_recommendation(
+            "Aus Home-Assistant-Backup wiederherstellen",
+            "Wenn der Integrity-Check echte Korruption meldet, ist ein Restore aus einem bekannten guten HA-Backup meist die sicherste Loesung.",
+        )
+
+    return {"problems": problems, "recommendations": recommendations, "actions": actions}
+
+
 def table_names(conn: sqlite3.Connection) -> set[str]:
     rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
     return {str(row["name"]) for row in rows}
@@ -356,9 +471,11 @@ def analyze_database(path: Path) -> dict[str, Any]:
 
     if not path.exists():
         result["error"] = "Database file does not exist."
+        result["diagnostics"] = build_database_diagnostics(result)
         return result
     if not is_sqlite_file(path):
         result["error"] = "File is not a SQLite database."
+        result["diagnostics"] = build_database_diagnostics(result)
         return result
 
     result["sqlite_header"] = True
@@ -847,6 +964,14 @@ def analyze_database_best_effort(path: Path) -> dict[str, Any]:
         "last_statistic": None,
         "first_state": None,
         "last_state": None,
+        "quick_check": [],
+        "journal_mode": None,
+        "page_count": None,
+        "freelist_count": None,
+        "schema_version": None,
+        "user_version": None,
+        "sidecars": database_sidecar_files(path),
+        "diagnostics": {"problems": [], "recommendations": [], "actions": []},
         "read_errors": [],
         "error": None,
     }
@@ -876,6 +1001,18 @@ def analyze_database_best_effort(path: Path) -> dict[str, Any]:
                     result["read_errors"].extend(result["integrity"])
             except sqlite3.DatabaseError as err:
                 add_error("integrity_check", err)
+
+            try:
+                quick_rows = conn.execute("PRAGMA quick_check(20)").fetchall()
+                result["quick_check"] = [str(row[0]) for row in quick_rows]
+            except sqlite3.DatabaseError as err:
+                add_error("quick_check", err)
+
+            for pragma in ("journal_mode", "page_count", "freelist_count", "schema_version", "user_version"):
+                try:
+                    result[pragma] = read_pragma(conn, pragma)
+                except sqlite3.DatabaseError as err:
+                    add_error(pragma, err)
 
             try:
                 fk_rows = conn.execute("PRAGMA foreign_key_check").fetchmany(20)
@@ -942,6 +1079,7 @@ def analyze_database_best_effort(path: Path) -> dict[str, Any]:
 
     if result["readable"] and result["ok"] is False and not result["error"]:
         result["error"] = "Database has integrity warnings, but readable parts can be used."
+    result["diagnostics"] = build_database_diagnostics(result)
     return result
 
 
@@ -1313,6 +1451,51 @@ def backup_current_database(current_db: Path) -> str:
         with sqlite3.connect(str(backup_path)) as destination:
             source.backup(destination)
     return str(backup_path)
+
+
+def create_current_database_snapshot() -> dict[str, Any]:
+    options = read_options()
+    current_db = Path(str(options["database_path"]))
+    if not current_db.exists():
+        raise AppError("Current Home Assistant database was not found.")
+    if not is_sqlite_file(current_db):
+        raise AppError("Current Home Assistant database path does not point to a SQLite database.")
+    backup_path = backup_current_database(current_db)
+    analysis = analyze_database(Path(backup_path))
+    return {
+        "snapshot_path": backup_path,
+        "snapshot_analysis": analysis,
+        "source_analysis": analyze_database(current_db),
+    }
+
+
+def checkpoint_current_database(mode: str = "PASSIVE") -> dict[str, Any]:
+    normalized_mode = mode.upper()
+    if normalized_mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+        raise AppError("Unsupported WAL checkpoint mode.")
+    options = read_options()
+    current_db = Path(str(options["database_path"]))
+    if not current_db.exists():
+        raise AppError("Current Home Assistant database was not found.")
+    if not is_sqlite_file(current_db):
+        raise AppError("Current Home Assistant database path does not point to a SQLite database.")
+
+    before = analyze_database(current_db)
+    row_payload = None
+    with open_db(current_db, readonly=False, timeout=30) as conn:
+        conn.execute("PRAGMA busy_timeout = 30000")
+        row = conn.execute(f"PRAGMA wal_checkpoint({normalized_mode})").fetchone()
+        if row is not None:
+            keys = row.keys()
+            row_payload = dict(row) if keys else list(row)
+    after = analyze_database(current_db)
+    return {
+        "mode": normalized_mode,
+        "checkpoint": row_payload,
+        "before": before,
+        "after": after,
+        "restart_recommended": not bool(after.get("ok")),
+    }
 
 
 def list_current_db_backups(offset: int = 0, limit: int = 100) -> dict[str, Any]:
@@ -2291,6 +2474,20 @@ def job_restore_current_db(job_id: str, backup_id: str) -> dict[str, Any]:
     return result
 
 
+def job_snapshot_current_db(job_id: str) -> dict[str, Any]:
+    update_job(job_id, progress=15, message="Konsistente Sicherung der aktuellen DB wird erstellt.")
+    result = create_current_database_snapshot()
+    update_job(job_id, progress=90, message="Snapshot erstellt und analysiert.")
+    return result
+
+
+def job_checkpoint_current_db(job_id: str, mode: str = "PASSIVE") -> dict[str, Any]:
+    update_job(job_id, progress=15, message=f"WAL-Checkpoint wird ausgefuehrt: {mode.upper()}.")
+    result = checkpoint_current_database(mode)
+    update_job(job_id, progress=90, message="WAL-Checkpoint abgeschlossen und DB neu analysiert.")
+    return result
+
+
 def create_action_job(payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action", "")).strip()
     if action == "load_backup":
@@ -2308,6 +2505,12 @@ def create_action_job(payload: dict[str, Any]) -> dict[str, Any]:
         if not bool(payload.get("confirm", False)):
             raise AppError("Restore needs explicit confirmation.")
         return start_job("restore_current_db", "Aktuelle DB wiederherstellen", job_restore_current_db, backup_id)
+    if action == "snapshot_current_db":
+        return start_job("snapshot_current_db", "Aktuelle DB-Snapshot erstellen", job_snapshot_current_db)
+    if action == "checkpoint_current_db":
+        if not bool(payload.get("confirm", False)):
+            raise AppError("WAL checkpoint needs explicit confirmation.")
+        return start_job("checkpoint_current_db", "WAL-Checkpoint ausfuehren", job_checkpoint_current_db, str(payload.get("mode", "PASSIVE")))
     raise AppError("Unknown job action.")
 
 
@@ -2331,7 +2534,7 @@ def app_status() -> dict[str, Any]:
             "create_current_db_backup": bool(options.get("create_current_db_backup", True)),
         },
         "cache": cache_status(),
-        "current_database": analyze_database(current_db) if current_db.exists() else {"exists": False, "path": str(current_db)},
+        "current_database": analyze_database(current_db),
     }
 
 
@@ -2356,7 +2559,7 @@ def paginated_source_entities(query: dict[str, list[str]]) -> dict[str, Any]:
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "BackupDbRestore/0.5.1"
+    server_version = "BackupDbRestore/0.5.2"
 
     def do_GET(self) -> None:
         try:

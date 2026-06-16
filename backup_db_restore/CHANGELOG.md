@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.2
+
+- Aktuelle-DB-Diagnose in der UI ergaenzt. Die Statuskarte zeigt nun nicht nur
+  `Nicht in Ordnung`, sondern eine eigene Diagnosekarte mit konkreten Problemen,
+  Loesungsvorschlaegen und JSON-Details.
+- Analyse der aktuellen DB erweitert: `quick_check`, `integrity_check`,
+  `foreign_key_check`, `journal_mode`, Page-/Freelist-Zaehler, Schema-Version,
+  User-Version und Sidecar-Dateien (`-wal`, `-shm`, `-journal`) werden erfasst.
+- Empfehlungen werden aus den Diagnosewerten abgeleitet, z. B. WAL-Checkpoint,
+  Snapshot/Sicherung, Home-Assistant-Neustart oder Restore aus HA-Backup.
+- Job `snapshot_current_db` ergaenzt: erstellt eine konsistente SQLite-Sicherung
+  der aktuellen DB und analysiert diese separat.
+- Job `checkpoint_current_db` ergaenzt: fuehrt nach Bestaetigung einen passiven
+  WAL-Checkpoint aus und analysiert die DB danach erneut.
+
 ## 0.5.1
 
 - Best-Effort-Lesen fuer beschaedigte Quell-Datenbanken ergaenzt.

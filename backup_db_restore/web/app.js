@@ -79,6 +79,9 @@ function setBusy(isBusy) {
     "refreshDbBackupsButton",
     "refreshReportsButton",
     "openReportButton",
+    "reanalyzeCurrentDbButton",
+    "snapshotCurrentDbButton",
+    "checkpointCurrentDbButton",
   ]) {
     $(id).disabled = isBusy;
   }
@@ -187,6 +190,51 @@ function setHealth(element, ok, emptyText) {
   element.className = ok ? "good" : "bad";
 }
 
+function renderDiagnosticsList(element, items, emptyText) {
+  if (!items || !items.length) {
+    element.innerHTML = `<li class="severity-info"><strong>${escapeHtml(emptyText)}</strong></li>`;
+    return;
+  }
+  element.innerHTML = items
+    .map((item) => `
+      <li class="severity-${escapeHtml(item.severity || "info")}">
+        <strong>${escapeHtml(item.title || "Hinweis")}</strong>
+        <span>${escapeHtml(item.detail || "")}</span>
+      </li>
+    `)
+    .join("");
+}
+
+function renderCurrentDbDiagnostics(target) {
+  const diagnostics = target?.diagnostics || {};
+  renderDiagnosticsList($("currentDbProblems"), diagnostics.problems || [], "Keine Probleme erkannt");
+  renderDiagnosticsList($("currentDbRecommendations"), diagnostics.recommendations || [], "Keine Aktion noetig");
+
+  const sidecars = target?.sidecars || {};
+  const detail = {
+    path: target?.path,
+    ok: target?.ok,
+    readable: target?.readable,
+    partial: target?.partial,
+    error: target?.error,
+    integrity: target?.integrity,
+    quick_check: target?.quick_check,
+    read_errors: target?.read_errors,
+    foreign_key_errors: target?.foreign_key_errors,
+    journal_mode: target?.journal_mode,
+    page_count: target?.page_count,
+    freelist_count: target?.freelist_count,
+    schema_version: target?.schema_version,
+    user_version: target?.user_version,
+    sidecars,
+    tables: target?.tables,
+  };
+  $("currentDbDiagnosticsDetails").textContent = JSON.stringify(detail, null, 2);
+
+  const actions = diagnostics.actions || [];
+  $("checkpointCurrentDbButton").disabled = !actions.includes("checkpoint");
+}
+
 function toApiDateTime(value) {
   if (!value) return null;
   const date = new Date(value);
@@ -231,6 +279,7 @@ function renderStatus() {
     $("targetHealth").className = "bad";
     $("targetDetails").textContent = "";
   }
+  renderCurrentDbDiagnostics(target);
 
   $("entityCount").textContent = String(source?.entities_count || 0);
   $("historyRange").textContent = source?.first_state ? `${formatDate(source.first_state)} - ${formatDate(source.last_state)}` : "";
@@ -623,6 +672,69 @@ async function restoreCurrentDb() {
   }
 }
 
+async function reanalyzeCurrentDb() {
+  setBusy(true);
+  clearOperationLog();
+  setProgress(25, "Aktuelle DB wird geprueft", true);
+  appendLog("Aktuelle Datenbankdiagnose wird neu geladen.");
+  try {
+    await refreshStatus();
+    finishProgress("Pruefung fertig");
+    toast("Aktuelle DB neu geprueft", "success");
+  } catch (error) {
+    setProgress(0, "Fehler");
+    appendLog(`Fehler: ${error.message}`);
+    toast(error.message, "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function snapshotCurrentDb() {
+  setBusy(true);
+  clearOperationLog();
+  setProgress(5, "Snapshot-Job startet");
+  try {
+    const job = await startJob({ action: "snapshot_current_db" });
+    const result = await waitForJob(job);
+    await refreshStatus();
+    $("currentDbDiagnosticsDetails").textContent = JSON.stringify(result, null, 2);
+    appendLog(`Snapshot erstellt: ${result.snapshot_path}`);
+    toast("Aktuelle DB-Snapshot erstellt und analysiert", "success");
+  } catch (error) {
+    setProgress(0, "Fehler");
+    appendLog(`Fehler: ${error.message}`);
+    toast(error.message, "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function checkpointCurrentDb() {
+  if (!$("confirmDbMaintenance").checked) {
+    toast("DB-Wartung bestaetigen", "warn");
+    return;
+  }
+
+  setBusy(true);
+  clearOperationLog();
+  setProgress(5, "WAL-Checkpoint startet");
+  try {
+    const job = await startJob({ action: "checkpoint_current_db", mode: "PASSIVE", confirm: true });
+    const result = await waitForJob(job);
+    await refreshStatus();
+    $("currentDbDiagnosticsDetails").textContent = JSON.stringify(result, null, 2);
+    toast("Passiver WAL-Checkpoint abgeschlossen", "success");
+  } catch (error) {
+    setProgress(0, "Fehler");
+    appendLog(`Fehler: ${error.message}`);
+    toast(error.message, "error");
+  } finally {
+    setBusy(false);
+    renderCurrentDbDiagnostics(state.status?.current_database);
+  }
+}
+
 async function openSelectedReport() {
   const reportId = $("reportSelect").value;
   if (!reportId) {
@@ -647,6 +759,9 @@ function bindEvents() {
   $("restoreDbButton").addEventListener("click", restoreCurrentDb);
   $("refreshReportsButton").addEventListener("click", () => refreshReports().catch((error) => toast(error.message, "error")));
   $("openReportButton").addEventListener("click", openSelectedReport);
+  $("reanalyzeCurrentDbButton").addEventListener("click", reanalyzeCurrentDb);
+  $("snapshotCurrentDbButton").addEventListener("click", snapshotCurrentDb);
+  $("checkpointCurrentDbButton").addEventListener("click", checkpointCurrentDb);
   $("sourceFilter").addEventListener("input", () => {
     window.clearTimeout(bindEvents.filterTimer);
     bindEvents.filterTimer = window.setTimeout(() => {

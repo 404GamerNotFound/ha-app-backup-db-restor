@@ -65,6 +65,29 @@
         </article>
       </section>
 
+      <section class="panel diagnostics-panel" aria-label="Aktuelle DB Diagnose">
+        <div class="panel-header">
+          <h2>Aktuelle DB-Diagnose</h2>
+          <div class="actions">
+            <button id="reanalyzeCurrentDbButton" class="secondary small" type="button">Neu pruefen</button>
+            <button id="snapshotCurrentDbButton" class="secondary small" type="button">Snapshot erstellen</button>
+            <button id="checkpointCurrentDbButton" class="secondary small" type="button">WAL-Checkpoint</button>
+          </div>
+        </div>
+        <div class="diagnostics-grid">
+          <div>
+            <h3>Probleme</h3>
+            <ul id="currentDbProblems" class="diagnostics-list"></ul>
+          </div>
+          <div>
+            <h3>Loesungen</h3>
+            <ul id="currentDbRecommendations" class="diagnostics-list"></ul>
+          </div>
+        </div>
+        <label class="confirm-line"><input id="confirmDbMaintenance" type="checkbox"> DB-Wartung bestaetigen</label>
+        <pre id="currentDbDiagnosticsDetails" aria-live="polite"></pre>
+      </section>
+
       <section class="management-grid" aria-label="Sicherungen und Reports">
         <article class="panel compact-panel">
           <div class="panel-header">

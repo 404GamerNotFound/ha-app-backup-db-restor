@@ -119,11 +119,41 @@ Restore wird nochmals eine Sicherung des aktuell vorhandenen DB-Stands erzeugt.
 Nach einem Restore ist ein Home-Assistant-Neustart empfohlen, damit Recorder und
 History sauber mit dem extern geaenderten DB-Zustand weiterarbeiten.
 
+## Aktuelle DB-Diagnose und Wartung
+
+Die Statuskarte `Aktuelle DB` nutzt nicht nur Dateiexistenz und Groesse, sondern
+eine SQLite-Diagnose. Die UI zeigt im Bereich `Aktuelle DB-Diagnose` konkrete
+Probleme und abgeleitete Loesungsvorschlaege an.
+
+Erfasst werden unter anderem:
+
+- `PRAGMA integrity_check(20)` und `PRAGMA quick_check(20)`
+- `PRAGMA foreign_key_check`
+- `journal_mode`, `page_count`, `freelist_count`, `schema_version`, `user_version`
+- vorhandene Sidecar-Dateien `home-assistant_v2.db-wal`,
+  `home-assistant_v2.db-shm` und `home-assistant_v2.db-journal`
+- lesbare Tabellen, State-/Statistik-Zahlen und Lesefehler
+
+Die UI bietet dazu drei Aktionen:
+
+- `Neu pruefen`: laedt `/api/status` erneut und aktualisiert die Diagnose.
+- `Snapshot erstellen`: startet den Job `snapshot_current_db`. Dabei wird per
+  SQLite Backup API eine konsistente Sicherung der aktuellen DB unter
+  `/data/current-db-backups` erzeugt und separat analysiert.
+- `WAL-Checkpoint`: startet nach Bestaetigung den Job `checkpoint_current_db` mit
+  Modus `PASSIVE`. Das kann helfen, wenn eine grosse `-wal`-Datei vorhanden ist
+  oder die Anzeige durch ausstehende WAL-Daten irritiert. Der passive Modus ist
+  bewusst konservativ und soll aktive Schreibzugriffe nicht aggressiv blockieren.
+
+Wenn `integrity_check` echte Korruption meldet, ersetzt der WAL-Checkpoint keine
+vollstaendige Reparatur. In diesem Fall ist ein Restore aus einem bekannten guten
+Home-Assistant-Backup normalerweise die sicherste Loesung.
+
 ## API-Uebersicht
 
 - `PUT /api/upload?async=1`: speichert den Upload und startet einen Analyse-Job.
 - `POST /api/jobs`: startet Jobs fuer `load_backup`, `refresh_cache`, `import`
-  und `restore_current_db`.
+  `restore_current_db`, `snapshot_current_db` und `checkpoint_current_db`.
 - `GET /api/jobs/{id}`: liefert Status, Fortschritt, Log, Ergebnis oder Fehler.
 - `POST /api/import/preview`: fuehrt eine read-only Vorabpruefung aus.
 - `GET /api/mapping/suggestions`: liefert Ziel-Entity-Vorschlaege.
