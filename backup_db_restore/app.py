@@ -580,6 +580,376 @@ def list_entities(path: Path, limit: int | None = 5000) -> list[dict[str, Any]]:
         return entities[:limit] if limit is not None else entities
 
 
+def read_error(area: str, err: Exception) -> str:
+    return f"{area}: {err}"
+
+
+def query_rows_best_effort(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: list[Any] | tuple[Any, ...],
+    errors: list[str],
+    area: str,
+):
+    try:
+        cursor = conn.execute(sql, params)
+    except sqlite3.DatabaseError as err:
+        errors.append(read_error(area, err))
+        return
+    while True:
+        try:
+            row = cursor.fetchone()
+        except sqlite3.DatabaseError as err:
+            errors.append(read_error(area, err))
+            return
+        if row is None:
+            return
+        yield row
+
+
+def list_statistics_best_effort(path: Path, limit: int | None = 5000) -> list[dict[str, Any]]:
+    if not path.exists() or not is_sqlite_file(path):
+        return []
+
+    summaries: dict[str, dict[str, Any]] = {}
+    with open_db(path, readonly=True) as conn:
+        try:
+            tables = table_names(conn)
+        except sqlite3.DatabaseError:
+            return []
+        if "statistics_meta" not in tables:
+            return []
+
+        try:
+            meta_columns = table_columns(conn, "statistics_meta")
+        except sqlite3.DatabaseError:
+            return []
+        meta_names = [str(column["name"]) for column in meta_columns]
+        meta_pk = statistics_meta_primary_key(meta_columns)
+        if not meta_pk or "statistic_id" not in meta_names:
+            return []
+
+        meta_sql = "SELECT statistic_id FROM statistics_meta WHERE statistic_id IS NOT NULL ORDER BY statistic_id"
+        meta_params: list[Any] = []
+        if limit is not None:
+            meta_sql = f"{meta_sql} LIMIT ?"
+            meta_params.append(limit)
+        meta_errors: list[str] = []
+        for row in query_rows_best_effort(conn, meta_sql, meta_params, meta_errors, "statistics_meta"):
+            statistic_id = row["statistic_id"]
+            summaries.setdefault(
+                statistic_id,
+                {
+                    "statistic_id": statistic_id,
+                    "statistics_count": 0,
+                    "statistics_short_term_count": 0,
+                    "first_statistic": None,
+                    "last_statistic": None,
+                    "read_errors": list(meta_errors),
+                },
+            )
+
+        for table in STATISTICS_TABLES:
+            if table not in tables:
+                continue
+            try:
+                columns = column_names(conn, table)
+            except sqlite3.DatabaseError:
+                continue
+            if "metadata_id" not in columns:
+                continue
+            start_column = start_time_column(columns)
+            first_expr = f"MIN(t.{quote_identifier(start_column)})" if start_column else "NULL"
+            last_expr = f"MAX(t.{quote_identifier(start_column)})" if start_column else "NULL"
+            sql = f"""
+                SELECT
+                    sm.statistic_id AS statistic_id,
+                    COUNT(*) AS row_count,
+                    {first_expr} AS first_seen,
+                    {last_expr} AS last_seen
+                FROM {quote_identifier(table)} t
+                JOIN statistics_meta sm ON sm.{quote_identifier(meta_pk)} = t.metadata_id
+                GROUP BY sm.statistic_id
+                ORDER BY sm.statistic_id
+            """
+            errors: list[str] = []
+            for row in query_rows_best_effort(conn, sql, [], errors, table):
+                statistic_id = row["statistic_id"]
+                summary = summaries.setdefault(
+                    statistic_id,
+                    {
+                        "statistic_id": statistic_id,
+                        "statistics_count": 0,
+                        "statistics_short_term_count": 0,
+                        "first_statistic": None,
+                        "last_statistic": None,
+                        "read_errors": [],
+                    },
+                )
+                count_key = "statistics_short_term_count" if table == "statistics_short_term" else "statistics_count"
+                summary[count_key] = int(row["row_count"])
+                first_seen = format_db_time(row["first_seen"])
+                last_seen = format_db_time(row["last_seen"])
+                if first_seen and (summary["first_statistic"] is None or str(first_seen) < str(summary["first_statistic"])):
+                    summary["first_statistic"] = first_seen
+                if last_seen and (summary["last_statistic"] is None or str(last_seen) > str(summary["last_statistic"])):
+                    summary["last_statistic"] = last_seen
+                if errors:
+                    summary.setdefault("read_errors", []).extend(errors)
+
+    return sorted(summaries.values(), key=lambda item: item["statistic_id"])[: limit or None]
+
+
+def list_entities_best_effort(path: Path, limit: int | None = 5000) -> list[dict[str, Any]]:
+    if not path.exists() or not is_sqlite_file(path):
+        return []
+
+    entities_by_id: dict[str, dict[str, Any]] = {}
+    with open_db(path, readonly=True) as conn:
+        try:
+            tables = table_names(conn)
+        except sqlite3.DatabaseError:
+            return []
+
+        if "states_meta" in tables:
+            errors: list[str] = []
+            for row in query_rows_best_effort(
+                conn,
+                "SELECT entity_id FROM states_meta WHERE entity_id IS NOT NULL ORDER BY entity_id",
+                [],
+                errors,
+                "states_meta",
+            ):
+                entity_id = row["entity_id"]
+                entities_by_id.setdefault(
+                    entity_id,
+                    {
+                        "entity_id": entity_id,
+                        "states_count": 0,
+                        "statistics_count": 0,
+                        "statistics_short_term_count": 0,
+                        "first_seen": None,
+                        "last_seen": None,
+                        "first_statistic": None,
+                        "last_statistic": None,
+                        "read_errors": list(errors),
+                    },
+                )
+
+        if "states" in tables:
+            try:
+                state_columns = column_names(conn, "states")
+            except sqlite3.DatabaseError:
+                state_columns = []
+            time_expr = state_time_column(state_columns, alias="s") if state_columns else None
+            first_expr = f"MIN({time_expr})" if time_expr else "NULL"
+            last_expr = f"MAX({time_expr})" if time_expr else "NULL"
+
+            if "states_meta" in tables and "metadata_id" in state_columns:
+                sql = f"""
+                    SELECT
+                        sm.entity_id AS entity_id,
+                        COUNT(s.state_id) AS states_count,
+                        {first_expr} AS first_seen,
+                        {last_expr} AS last_seen
+                    FROM states_meta sm
+                    LEFT JOIN states s ON sm.metadata_id = s.metadata_id
+                    WHERE sm.entity_id IS NOT NULL
+                    GROUP BY sm.entity_id
+                    ORDER BY sm.entity_id
+                """
+            elif "entity_id" in state_columns:
+                sql = f"""
+                    SELECT
+                        s.entity_id AS entity_id,
+                        COUNT(*) AS states_count,
+                        {first_expr} AS first_seen,
+                        {last_expr} AS last_seen
+                    FROM states s
+                    WHERE s.entity_id IS NOT NULL
+                    GROUP BY s.entity_id
+                    ORDER BY s.entity_id
+                """
+            else:
+                sql = ""
+
+            if sql:
+                errors = []
+                for row in query_rows_best_effort(conn, sql, [], errors, "states"):
+                    entity_id = row["entity_id"]
+                    entity = entities_by_id.setdefault(
+                        entity_id,
+                        {
+                            "entity_id": entity_id,
+                            "states_count": 0,
+                            "statistics_count": 0,
+                            "statistics_short_term_count": 0,
+                            "first_seen": None,
+                            "last_seen": None,
+                            "first_statistic": None,
+                            "last_statistic": None,
+                            "read_errors": [],
+                        },
+                    )
+                    entity["states_count"] = int(row["states_count"] or 0)
+                    entity["first_seen"] = format_db_time(row["first_seen"])
+                    entity["last_seen"] = format_db_time(row["last_seen"])
+                    if errors:
+                        entity.setdefault("read_errors", []).extend(errors)
+
+        for statistic in list_statistics_best_effort(path, limit=None):
+            statistic_id = statistic["statistic_id"]
+            if not ENTITY_ID_RE.match(str(statistic_id)):
+                continue
+            entity = entities_by_id.setdefault(
+                statistic_id,
+                {
+                    "entity_id": statistic_id,
+                    "states_count": 0,
+                    "statistics_count": 0,
+                    "statistics_short_term_count": 0,
+                    "first_seen": None,
+                    "last_seen": None,
+                    "first_statistic": None,
+                    "last_statistic": None,
+                    "read_errors": [],
+                },
+            )
+            entity["statistics_count"] = statistic["statistics_count"]
+            entity["statistics_short_term_count"] = statistic["statistics_short_term_count"]
+            entity["first_statistic"] = statistic["first_statistic"]
+            entity["last_statistic"] = statistic["last_statistic"]
+            if statistic.get("read_errors"):
+                entity.setdefault("read_errors", []).extend(statistic["read_errors"])
+
+    entities = sorted(entities_by_id.values(), key=lambda item: item["entity_id"])
+    return entities[:limit] if limit is not None else entities
+
+
+def analyze_database_best_effort(path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "size_bytes": path.stat().st_size if path.exists() else 0,
+        "sqlite_header": False,
+        "readable": False,
+        "partial": False,
+        "ok": False,
+        "integrity": [],
+        "foreign_key_errors": [],
+        "tables": [],
+        "states_count": 0,
+        "entities_count": 0,
+        "statistics_count": 0,
+        "statistics_short_term_count": 0,
+        "statistics_entities_count": 0,
+        "first_statistic": None,
+        "last_statistic": None,
+        "first_state": None,
+        "last_state": None,
+        "read_errors": [],
+        "error": None,
+    }
+
+    def add_error(area: str, err: Exception | str) -> None:
+        message = read_error(area, err if isinstance(err, Exception) else Exception(str(err)))
+        result["read_errors"].append(message)
+        result["partial"] = True
+
+    if not path.exists():
+        result["error"] = "Database file does not exist."
+        return result
+    if not is_sqlite_file(path):
+        result["error"] = "File is not a SQLite database."
+        return result
+
+    result["sqlite_header"] = True
+    try:
+        with open_db(path, readonly=True) as conn:
+            result["readable"] = True
+            try:
+                integrity_rows = conn.execute("PRAGMA integrity_check(20)").fetchall()
+                result["integrity"] = [str(row[0]) for row in integrity_rows]
+                result["ok"] = result["integrity"] == ["ok"]
+                if not result["ok"]:
+                    result["partial"] = True
+                    result["read_errors"].extend(result["integrity"])
+            except sqlite3.DatabaseError as err:
+                add_error("integrity_check", err)
+
+            try:
+                fk_rows = conn.execute("PRAGMA foreign_key_check").fetchmany(20)
+                result["foreign_key_errors"] = [list(row) for row in fk_rows]
+            except sqlite3.DatabaseError as err:
+                add_error("foreign_key_check", err)
+
+            try:
+                tables = sorted(table_names(conn))
+                result["tables"] = tables
+            except sqlite3.DatabaseError as err:
+                add_error("table_list", err)
+                tables = []
+
+            if "states" in tables:
+                try:
+                    state_columns = column_names(conn, "states")
+                    result["states_count"] = int(conn.execute("SELECT COUNT(*) FROM states").fetchone()[0])
+                    time_expr = state_time_column(state_columns)
+                    if time_expr:
+                        row = conn.execute(f"SELECT MIN({time_expr}), MAX({time_expr}) FROM states").fetchone()
+                        result["first_state"] = format_db_time(row[0])
+                        result["last_state"] = format_db_time(row[1])
+                except sqlite3.DatabaseError as err:
+                    add_error("states", err)
+
+            if "statistics_meta" in tables:
+                try:
+                    result["statistics_entities_count"] = len(list_statistics_best_effort(path, limit=None))
+                    result["entities_count"] = len(list_entities_best_effort(path, limit=None))
+                except sqlite3.DatabaseError as err:
+                    add_error("statistics_meta", err)
+
+            for table in STATISTICS_TABLES:
+                if table not in tables:
+                    continue
+                try:
+                    columns = column_names(conn, table)
+                    count = int(conn.execute(f"SELECT COUNT(*) FROM {quote_identifier(table)}").fetchone()[0])
+                    if table == "statistics_short_term":
+                        result["statistics_short_term_count"] = count
+                    else:
+                        result["statistics_count"] = count
+                    start_column = start_time_column(columns)
+                    if start_column:
+                        row = conn.execute(
+                            f"SELECT MIN({quote_identifier(start_column)}), MAX({quote_identifier(start_column)}) FROM {quote_identifier(table)}"
+                        ).fetchone()
+                        if row[0] is not None:
+                            first = format_db_time(row[0])
+                            last = format_db_time(row[1])
+                            if result["first_statistic"] is None or str(first) < str(result["first_statistic"]):
+                                result["first_statistic"] = first
+                            if result["last_statistic"] is None or str(last) > str(result["last_statistic"]):
+                                result["last_statistic"] = last
+                except sqlite3.DatabaseError as err:
+                    add_error(table, err)
+
+            if not result["entities_count"]:
+                result["entities_count"] = len(list_entities_best_effort(path, limit=None))
+    except sqlite3.DatabaseError as err:
+        result["error"] = str(err)
+        result["partial"] = bool(result["sqlite_header"])
+
+    if result["readable"] and result["ok"] is False and not result["error"]:
+        result["error"] = "Database has integrity warnings, but readable parts can be used."
+    return result
+
+
+list_statistics = list_statistics_best_effort
+list_entities = list_entities_best_effort
+analyze_database = analyze_database_best_effort
+
+
 def list_current_entities() -> dict[str, Any]:
     options = read_options()
     entities: dict[str, dict[str, Any]] = {}
@@ -1110,6 +1480,7 @@ class HistoryImporter:
         self.duplicate_strategy = duplicate_strategy if duplicate_strategy in {"skip", "replace"} else "skip"
         self.progress_callback = progress_callback
         self.attribute_map: dict[int, int | None] = {}
+        self.source_warnings: list[str] = []
 
     def run(self) -> dict[str, Any]:
         if not self.source_db.exists():
@@ -1123,8 +1494,10 @@ class HistoryImporter:
 
         source_analysis = analyze_database(self.source_db)
         target_analysis = analyze_database(self.target_db)
-        if not source_analysis["sqlite_header"] or not source_analysis["ok"]:
-            raise AppError("Source database is not healthy enough for import.")
+        if not source_analysis["sqlite_header"] or not source_analysis.get("readable", False):
+            raise AppError("Source database is not readable enough for import.")
+        if not source_analysis.get("ok", False):
+            self.source_warnings = list(source_analysis.get("read_errors") or [])
         if not target_analysis["sqlite_header"] or not target_analysis["ok"]:
             raise AppError("Current database is not healthy enough for import.")
 
@@ -1205,8 +1578,9 @@ class HistoryImporter:
         scanned = 0
         first_imported = None
         last_imported = None
+        read_errors: list[str] = []
 
-        for source_row in source_conn.execute(source_sql, query_params):
+        for source_row in query_rows_best_effort(source_conn, source_sql, query_params, read_errors, "states"):
             scanned += 1
             duplicate = self.is_duplicate(target_conn, source_row, target_metadata_id, target_state_names)
             if duplicate:
@@ -1254,6 +1628,9 @@ class HistoryImporter:
             "duplicate_strategy": self.duplicate_strategy,
             "start": self.start,
             "end": self.end,
+            "source_warnings": self.source_warnings,
+            "read_errors": read_errors,
+            "partial": bool(self.source_warnings or read_errors),
             "first_imported": first_imported,
             "last_imported": last_imported,
             "backup_path": None,
