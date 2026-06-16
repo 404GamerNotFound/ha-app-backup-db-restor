@@ -168,6 +168,35 @@ h3 {
   margin-bottom: 16px;
 }
 
+.tabbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.tab-button {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--muted);
+}
+
+.tab-button:hover,
+.tab-button.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: white;
+}
+
+.tab-page {
+  display: grid;
+  gap: 16px;
+}
+
+.tab-page[hidden] {
+  display: none;
+}
+
 .device-backups {
   align-items: stretch;
 }
@@ -263,22 +292,23 @@ h3 {
 
 .status-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
-  margin-bottom: 16px;
 }
 
 .management-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
-  margin-bottom: 16px;
+}
+
+.single-management {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .diagnostics-panel {
   display: grid;
   gap: 12px;
-  margin-bottom: 16px;
 }
 
 .diagnostics-grid {

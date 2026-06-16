@@ -16,6 +16,7 @@ const state = {
     total: 0,
     filter: "",
   },
+  activeTab: "analysis",
   status: null,
 };
 
@@ -64,6 +65,25 @@ function setProgress(percent, status, indeterminate = false) {
 function finishProgress(status) {
   setProgress(100, status);
   window.setTimeout(() => setProgress(0, "Bereit"), 1200);
+}
+
+function setActiveTab(tabName, updateHash = true) {
+  const isImport = tabName === "import";
+  state.activeTab = isImport ? "import" : "analysis";
+
+  $("analysisPage").hidden = isImport;
+  $("importPage").hidden = !isImport;
+  $("analysisPage").classList.toggle("active", !isImport);
+  $("importPage").classList.toggle("active", isImport);
+
+  $("analysisTabButton").classList.toggle("active", !isImport);
+  $("importTabButton").classList.toggle("active", isImport);
+  $("analysisTabButton").setAttribute("aria-selected", String(!isImport));
+  $("importTabButton").setAttribute("aria-selected", String(isImport));
+
+  if (updateHash) {
+    window.history.replaceState(null, "", isImport ? "#import" : "#analyse");
+  }
 }
 
 function setBusy(isBusy) {
@@ -281,12 +301,28 @@ function renderStatus() {
   }
   renderCurrentDbDiagnostics(target);
 
-  $("entityCount").textContent = String(source?.entities_count || 0);
-  $("historyRange").textContent = source?.first_state ? `${formatDate(source.first_state)} - ${formatDate(source.last_state)}` : "";
+  const targetEntityCount = Number(target?.entities_count || state.currentEntities.length || 0);
+  const sourceEntityCount = Number(source?.entities_count || 0);
+  $("currentEntityCount").textContent = String(targetEntityCount);
+  $("currentEntityDetails").textContent = target?.first_state
+    ? `Aktuelle Instanz / ${formatDate(target.first_state)} - ${formatDate(target.last_state)}`
+    : "Aktuelle Instanz / kein Recorder-Zeitraum";
+
+  if (source && source.exists) {
+    $("backupEntityCount").textContent = String(sourceEntityCount);
+    const range = source.first_state ? `${formatDate(source.first_state)} - ${formatDate(source.last_state)}` : "Kein Zeitraum";
+    $("backupEntityDetails").textContent = `Geladene Backup-DB / ${range}`;
+  } else {
+    $("backupEntityCount").textContent = "0";
+    $("backupEntityDetails").textContent = "Keine Backup-DB geladen";
+  }
 
   const badge = $("healthBadge");
-  const allOk = Boolean(source?.ok) && Boolean(target?.ok);
-  badge.textContent = allOk ? "Bereit" : "Pruefen";
+  const targetOk = Boolean(target?.ok);
+  const sourceLoaded = Boolean(source?.exists);
+  const sourceOk = !sourceLoaded || Boolean(source?.ok);
+  const allOk = targetOk && sourceOk;
+  badge.textContent = allOk ? (sourceLoaded ? "Bereit" : "Aktuelle DB ok") : "Pruefen";
   badge.className = allOk ? "badge badge-good" : "badge badge-muted";
 }
 
@@ -449,11 +485,11 @@ async function refreshReports() {
 
 async function refreshStatus() {
   state.status = await api("api/status");
-  renderStatus();
 
   const current = await api("api/current/entities");
   state.currentEntities = current.entities || [];
   renderTargetEntities();
+  renderStatus();
 
   await fetchSourceEntities();
   await refreshCurrentDbBackups();
@@ -750,6 +786,8 @@ async function openSelectedReport() {
 }
 
 function bindEvents() {
+  $("analysisTabButton").addEventListener("click", () => setActiveTab("analysis"));
+  $("importTabButton").addEventListener("click", () => setActiveTab("import"));
   $("uploadButton").addEventListener("click", uploadSelectedFile);
   $("cacheButton").addEventListener("click", refreshCache);
   $("clearCacheButton").addEventListener("click", clearCache);
@@ -811,6 +849,7 @@ function bindEvents() {
   $("importButton").addEventListener("click", runImport);
 }
 
+setActiveTab(window.location.hash === "#import" ? "import" : "analysis", false);
 bindEvents();
 refreshBackups();
 refreshStatus().catch((error) => toast(error.message, "error"));

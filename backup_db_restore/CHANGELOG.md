@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.5
+
+- UI in zwei Arbeitsbereiche geteilt: `Aktuelle DB-Analyse` fuer die bestehende
+  Home-Assistant-Recorder-Datenbank und `Backup & Import` fuer Upload,
+  Backup-Auswahl, Quell-Entitaeten, Mapping, Import und Reports.
+- Aktuelle Datenbankinformationen, Probleme, Loesungsvorschlaege,
+  WAL-/Snapshot-Aktionen und aktuelle DB-Sicherungen sind nun gebuendelt im
+  Analyse-Tab sichtbar.
+- Backup-Status, Backup-Entitaeten, Cache-Aktionen und Import-Reports sind nun
+  gebuendelt im Import-Tab sichtbar.
+- Status-Badge oben unterscheidet nun eine intakte aktuelle DB ohne geladene
+  Backup-Quelle von einem komplett importbereiten Zustand.
+
+## 0.5.4
+
+- Statusbereich eindeutiger gemacht: `Aktuelle Entitaeten` und
+  `Backup-Entitaeten` werden nun als getrennte Karten angezeigt.
+- Die Backup-Karte zeigt `Keine Backup-DB geladen`, solange keine Quell-DB
+  analysiert wurde.
+- Die aktuelle Karte zeigt dauerhaft die Entitaeten der aktuellen Instanz bzw.
+  aktuellen Recorder-Datenbank.
+
+## 0.5.3
+
+- Statuskarte `Entitaeten` korrigiert: Wenn keine Quell-/Backup-DB geladen ist,
+  zeigt die Karte nun die Entitaeten der aktuellen Home-Assistant-Instanz bzw.
+  aktuellen Recorder-DB statt `0`.
+- Sobald eine Backup-DB geladen ist, wechselt die Karte auf
+  `Backup-Entitaeten` und zeigt zusaetzlich die Anzahl aktueller Entitaeten an.
+
 ## 0.5.2
 
 - Aktuelle-DB-Diagnose in der UI ergaenzt. Die Statuskarte zeigt nun nicht nur

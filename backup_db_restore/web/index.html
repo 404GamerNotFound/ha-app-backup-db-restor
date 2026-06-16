@@ -16,25 +16,10 @@
         <div id="healthBadge" class="badge badge-muted">Pruefung laedt</div>
       </header>
 
-      <section class="toolbar" aria-label="Upload">
-        <label class="file-picker">
-          <input id="fileInput" type="file" accept=".db,.sqlite,.sqlite3,.tar,.tar.gz,.tgz,.gz,.backup">
-          <span>Datei waehlen</span>
-        </label>
-        <button id="uploadButton" type="button">Analysieren</button>
-        <button id="cacheButton" type="button">Zwischenspeichern</button>
-        <button id="clearCacheButton" class="secondary" type="button">Cache leeren</button>
-      </section>
-
-      <section class="toolbar device-backups" aria-label="Gespeicherte Backups">
-        <input id="backupFilter" type="search" placeholder="Backups filtern">
-        <select id="deviceBackupSelect" aria-label="Gespeichertes Backup"></select>
-        <button id="loadBackupButton" type="button">Aus Backup lesen</button>
-        <button id="refreshBackupsButton" class="secondary" type="button">Backups aktualisieren</button>
-        <span id="backupListInfo"></span>
-        <button id="prevBackupPageButton" class="secondary small" type="button">Zurueck</button>
-        <button id="nextBackupPageButton" class="secondary small" type="button">Weiter</button>
-      </section>
+      <nav class="tabbar" aria-label="Arbeitsbereich">
+        <button id="analysisTabButton" class="tab-button active" type="button" role="tab" aria-selected="true" aria-controls="analysisPage">Aktuelle DB-Analyse</button>
+        <button id="importTabButton" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="importPage">Backup & Import</button>
+      </nav>
 
       <section class="progress-panel" aria-label="Fortschritt">
         <div class="progress-header">
@@ -47,151 +32,185 @@
         <pre id="operationLog" class="operation-log" aria-live="polite"></pre>
       </section>
 
-      <section class="status-grid" aria-label="Status">
-        <article class="status-box">
-          <span class="status-label">Hochgeladene DB</span>
-          <strong id="sourceHealth">Keine Datei</strong>
-          <span id="sourceDetails"></span>
-        </article>
-        <article class="status-box">
-          <span class="status-label">Aktuelle DB</span>
-          <strong id="targetHealth">Unbekannt</strong>
-          <span id="targetDetails"></span>
-        </article>
-        <article class="status-box">
-          <span class="status-label">Entitaeten</span>
-          <strong id="entityCount">0</strong>
-          <span id="historyRange"></span>
-        </article>
+      <section id="analysisPage" class="tab-page active" role="tabpanel" aria-labelledby="analysisTabButton">
+        <section class="status-grid" aria-label="Aktuelle Datenbank">
+          <article class="status-box">
+            <span class="status-label">Aktuelle DB</span>
+            <strong id="targetHealth">Unbekannt</strong>
+            <span id="targetDetails"></span>
+          </article>
+          <article class="status-box">
+            <span class="status-label">Aktuelle Entitaeten</span>
+            <strong id="currentEntityCount">0</strong>
+            <span id="currentEntityDetails"></span>
+          </article>
+        </section>
+
+        <section class="panel diagnostics-panel" aria-label="Aktuelle DB Diagnose">
+          <div class="panel-header">
+            <h2>Aktuelle DB-Diagnose</h2>
+            <div class="actions">
+              <button id="reanalyzeCurrentDbButton" class="secondary small" type="button">Neu pruefen</button>
+              <button id="snapshotCurrentDbButton" class="secondary small" type="button">Snapshot erstellen</button>
+              <button id="checkpointCurrentDbButton" class="secondary small" type="button">WAL-Checkpoint</button>
+            </div>
+          </div>
+          <div class="diagnostics-grid">
+            <div>
+              <h3>Probleme</h3>
+              <ul id="currentDbProblems" class="diagnostics-list"></ul>
+            </div>
+            <div>
+              <h3>Loesungen</h3>
+              <ul id="currentDbRecommendations" class="diagnostics-list"></ul>
+            </div>
+          </div>
+          <label class="confirm-line"><input id="confirmDbMaintenance" type="checkbox"> DB-Wartung bestaetigen</label>
+          <pre id="currentDbDiagnosticsDetails" aria-live="polite"></pre>
+        </section>
+
+        <section class="management-grid single-management" aria-label="Aktuelle Datenbank-Sicherungen">
+          <article class="panel compact-panel">
+            <div class="panel-header">
+              <h2>Aktuelle DB-Sicherungen</h2>
+              <button id="refreshDbBackupsButton" class="secondary small" type="button">Aktualisieren</button>
+            </div>
+            <select id="currentDbBackupSelect" aria-label="Aktuelle DB-Sicherung"></select>
+            <div class="actions">
+              <label class="confirm-line"><input id="confirmRestore" type="checkbox"> Restore bestaetigen</label>
+              <button id="restoreDbButton" type="button">Aktuelle DB wiederherstellen</button>
+            </div>
+            <span id="currentDbBackupInfo" class="muted-line"></span>
+          </article>
+        </section>
       </section>
 
-      <section class="panel diagnostics-panel" aria-label="Aktuelle DB Diagnose">
-        <div class="panel-header">
-          <h2>Aktuelle DB-Diagnose</h2>
-          <div class="actions">
-            <button id="reanalyzeCurrentDbButton" class="secondary small" type="button">Neu pruefen</button>
-            <button id="snapshotCurrentDbButton" class="secondary small" type="button">Snapshot erstellen</button>
-            <button id="checkpointCurrentDbButton" class="secondary small" type="button">WAL-Checkpoint</button>
-          </div>
-        </div>
-        <div class="diagnostics-grid">
-          <div>
-            <h3>Probleme</h3>
-            <ul id="currentDbProblems" class="diagnostics-list"></ul>
-          </div>
-          <div>
-            <h3>Loesungen</h3>
-            <ul id="currentDbRecommendations" class="diagnostics-list"></ul>
-          </div>
-        </div>
-        <label class="confirm-line"><input id="confirmDbMaintenance" type="checkbox"> DB-Wartung bestaetigen</label>
-        <pre id="currentDbDiagnosticsDetails" aria-live="polite"></pre>
-      </section>
+      <section id="importPage" class="tab-page" role="tabpanel" aria-labelledby="importTabButton" hidden>
+        <section class="toolbar" aria-label="Upload">
+          <label class="file-picker">
+            <input id="fileInput" type="file" accept=".db,.sqlite,.sqlite3,.tar,.tar.gz,.tgz,.gz,.backup">
+            <span>Datei waehlen</span>
+          </label>
+          <button id="uploadButton" type="button">Analysieren</button>
+          <button id="cacheButton" type="button">Zwischenspeichern</button>
+          <button id="clearCacheButton" class="secondary" type="button">Cache leeren</button>
+        </section>
 
-      <section class="management-grid" aria-label="Sicherungen und Reports">
-        <article class="panel compact-panel">
-          <div class="panel-header">
-            <h2>Aktuelle DB-Sicherungen</h2>
-            <button id="refreshDbBackupsButton" class="secondary small" type="button">Aktualisieren</button>
-          </div>
-          <select id="currentDbBackupSelect" aria-label="Aktuelle DB-Sicherung"></select>
-          <div class="actions">
-            <label class="confirm-line"><input id="confirmRestore" type="checkbox"> Restore bestaetigen</label>
-            <button id="restoreDbButton" type="button">Aktuelle DB wiederherstellen</button>
-          </div>
-          <span id="currentDbBackupInfo" class="muted-line"></span>
-        </article>
+        <section class="toolbar device-backups" aria-label="Gespeicherte Backups">
+          <input id="backupFilter" type="search" placeholder="Backups filtern">
+          <select id="deviceBackupSelect" aria-label="Gespeichertes Backup"></select>
+          <button id="loadBackupButton" type="button">Aus Backup lesen</button>
+          <button id="refreshBackupsButton" class="secondary" type="button">Backups aktualisieren</button>
+          <span id="backupListInfo"></span>
+          <button id="prevBackupPageButton" class="secondary small" type="button">Zurueck</button>
+          <button id="nextBackupPageButton" class="secondary small" type="button">Weiter</button>
+        </section>
 
-        <article class="panel compact-panel">
-          <div class="panel-header">
-            <h2>Import-Reports</h2>
-            <button id="refreshReportsButton" class="secondary small" type="button">Aktualisieren</button>
-          </div>
-          <select id="reportSelect" aria-label="Import-Report"></select>
-          <div class="actions">
-            <button id="openReportButton" type="button">Report anzeigen</button>
-          </div>
-          <pre id="reportView" aria-live="polite"></pre>
-        </article>
-      </section>
+        <section class="status-grid" aria-label="Backup Datenbank">
+          <article class="status-box">
+            <span class="status-label">Hochgeladene DB</span>
+            <strong id="sourceHealth">Keine Datei</strong>
+            <span id="sourceDetails"></span>
+          </article>
+          <article class="status-box">
+            <span class="status-label">Backup-Entitaeten</span>
+            <strong id="backupEntityCount">0</strong>
+            <span id="backupEntityDetails"></span>
+          </article>
+        </section>
 
-      <section class="split-layout">
-        <div class="panel">
-          <div class="panel-header">
-            <h2>Backup-Entitaeten</h2>
-            <input id="sourceFilter" type="search" placeholder="Filtern">
+        <section class="management-grid single-management" aria-label="Import-Reports">
+          <article class="panel compact-panel">
+            <div class="panel-header">
+              <h2>Import-Reports</h2>
+              <button id="refreshReportsButton" class="secondary small" type="button">Aktualisieren</button>
+            </div>
+            <select id="reportSelect" aria-label="Import-Report"></select>
+            <div class="actions">
+              <button id="openReportButton" type="button">Report anzeigen</button>
+            </div>
+            <pre id="reportView" aria-live="polite"></pre>
+          </article>
+        </section>
+
+        <section class="split-layout">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Backup-Entitaeten</h2>
+              <input id="sourceFilter" type="search" placeholder="Filtern">
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Entity ID</th>
+                    <th>States</th>
+                    <th>Statistik</th>
+                    <th>Von</th>
+                    <th>Bis</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="sourceEntities"></tbody>
+              </table>
+            </div>
+            <div class="pager" aria-label="Entitaeten-Paging">
+              <button id="prevPageButton" class="secondary small" type="button">Zurueck</button>
+              <span id="pageInfo">0-0 von 0</span>
+              <button id="nextPageButton" class="secondary small" type="button">Weiter</button>
+              <label>
+                Pro Seite
+                <select id="pageSizeSelect">
+                  <option value="50">50</option>
+                  <option value="100" selected>100</option>
+                  <option value="250">250</option>
+                  <option value="500">500</option>
+                </select>
+              </label>
+            </div>
           </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Entity ID</th>
-                  <th>States</th>
-                  <th>Statistik</th>
-                  <th>Von</th>
-                  <th>Bis</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody id="sourceEntities"></tbody>
-            </table>
-          </div>
-          <div class="pager" aria-label="Entitaeten-Paging">
-            <button id="prevPageButton" class="secondary small" type="button">Zurueck</button>
-            <span id="pageInfo">0-0 von 0</span>
-            <button id="nextPageButton" class="secondary small" type="button">Weiter</button>
+
+          <aside class="panel import-panel">
+            <h2>Import</h2>
             <label>
-              Pro Seite
-              <select id="pageSizeSelect">
-                <option value="50">50</option>
-                <option value="100" selected>100</option>
-                <option value="250">250</option>
-                <option value="500">500</option>
+              Quelle
+              <input id="sourceEntity" type="text" autocomplete="off" spellcheck="false">
+            </label>
+            <label>
+              Ziel
+              <input id="targetEntity" list="targetEntityList" type="text" autocomplete="off" spellcheck="false">
+              <datalist id="targetEntityList"></datalist>
+            </label>
+            <div id="mappingSuggestions" class="suggestions" aria-live="polite"></div>
+            <div class="time-grid">
+              <label>
+                Von
+                <input id="startTime" type="datetime-local">
+              </label>
+              <label>
+                Bis
+                <input id="endTime" type="datetime-local">
+              </label>
+            </div>
+            <label>
+              Duplikate
+              <select id="duplicateStrategy">
+                <option value="skip" selected>Vorhandene ueberspringen</option>
+                <option value="replace">Gleiche Zeitstempel ersetzen</option>
               </select>
             </label>
-          </div>
-        </div>
-
-        <aside class="panel import-panel">
-          <h2>Import</h2>
-          <label>
-            Quelle
-            <input id="sourceEntity" type="text" autocomplete="off" spellcheck="false">
-          </label>
-          <label>
-            Ziel
-            <input id="targetEntity" list="targetEntityList" type="text" autocomplete="off" spellcheck="false">
-            <datalist id="targetEntityList"></datalist>
-          </label>
-          <div id="mappingSuggestions" class="suggestions" aria-live="polite"></div>
-          <div class="time-grid">
-            <label>
-              Von
-              <input id="startTime" type="datetime-local">
-            </label>
-            <label>
-              Bis
-              <input id="endTime" type="datetime-local">
-            </label>
-          </div>
-          <label>
-            Duplikate
-            <select id="duplicateStrategy">
-              <option value="skip" selected>Vorhandene ueberspringen</option>
-              <option value="replace">Gleiche Zeitstempel ersetzen</option>
-            </select>
-          </label>
-          <div class="inline-options">
-            <label><input id="dryRun" type="checkbox" checked> Nur pruefen</label>
-            <label><input id="includeStatistics" type="checkbox"> Long-Term-Statistics mit importieren</label>
-            <label><input id="confirmImport" type="checkbox"> Schreibimport bestaetigen</label>
-          </div>
-          <div class="actions">
-            <button id="previewButton" type="button">Import pruefen</button>
-            <button id="importButton" type="button">History importieren</button>
-          </div>
-          <pre id="importResult" aria-live="polite"></pre>
-        </aside>
+            <div class="inline-options">
+              <label><input id="dryRun" type="checkbox" checked> Nur pruefen</label>
+              <label><input id="includeStatistics" type="checkbox"> Long-Term-Statistics mit importieren</label>
+              <label><input id="confirmImport" type="checkbox"> Schreibimport bestaetigen</label>
+            </div>
+            <div class="actions">
+              <button id="previewButton" type="button">Import pruefen</button>
+              <button id="importButton" type="button">History importieren</button>
+            </div>
+            <pre id="importResult" aria-live="polite"></pre>
+          </aside>
+        </section>
       </section>
     </main>
 

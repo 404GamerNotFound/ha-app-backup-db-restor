@@ -2561,7 +2561,7 @@ def paginated_source_entities(query: dict[str, list[str]]) -> dict[str, Any]:
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "BackupDbRestore/0.5.2"
+    server_version = "BackupDbRestore/0.5.5"
 
     def do_GET(self) -> None:
         try:
