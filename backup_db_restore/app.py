@@ -749,7 +749,7 @@ def list_entities_best_effort(path: Path, limit: int | None = 5000) -> list[dict
                 sql = f"""
                     SELECT
                         sm.entity_id AS entity_id,
-                        COUNT(s.state_id) AS states_count,
+                        COUNT(s.metadata_id) AS states_count,
                         {first_expr} AS first_seen,
                         {last_expr} AS last_seen
                     FROM states_meta sm
@@ -2147,8 +2147,11 @@ def preflight_import(payload: dict[str, Any]) -> dict[str, Any]:
 
     source_analysis = analyze_database(SOURCE_DB) if SOURCE_DB.exists() else {"exists": False, "ok": False}
     target_analysis = analyze_database(target_db) if target_db.exists() else {"exists": False, "ok": False}
-    checks.append({"name": "source_database", "ok": bool(source_analysis.get("ok")), "details": source_analysis.get("error")})
+    source_readable = bool(source_analysis.get("sqlite_header")) and bool(source_analysis.get("readable", source_analysis.get("ok")))
+    checks.append({"name": "source_database", "ok": source_readable, "details": source_analysis.get("error")})
     checks.append({"name": "target_database", "ok": bool(target_analysis.get("ok")), "details": target_analysis.get("error")})
+    if source_analysis.get("partial") or source_analysis.get("read_errors"):
+        warnings.append("Die Quelldatenbank hat Integritaets- oder Lesewarnungen. Lesbare Bereiche werden best-effort verwendet.")
 
     if source_entity == target_entity:
         warnings.append("Quelle und Ziel haben dieselbe Entity ID. Das ist nur sinnvoll, wenn Daten aus einer alten DB ergaenzt werden.")
