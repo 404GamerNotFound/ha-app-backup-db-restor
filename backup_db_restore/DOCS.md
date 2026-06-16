@@ -76,6 +76,32 @@ Recorder-Datenbanken mit vielen Entitaeten bedienbar bleiben.
 Auch die Liste gespeicherter Backups aus `/backup` wird serverseitig paginiert
 und gefiltert. Dadurch bleiben Systeme mit vielen Backup-Dateien bedienbar.
 
+## Beschaedigte Quell-Datenbanken
+
+Die App arbeitet beim Lesen hochgeladener oder aus Backups extrahierter
+Quell-Datenbanken im Best-Effort-Modus. Wenn `PRAGMA integrity_check` Fehler
+meldet oder einzelne Tabellenbereiche nicht lesbar sind, wird die Datenbank nicht
+automatisch verworfen, solange der SQLite-Header gueltig ist und lesbare Tabellen
+vorhanden sind.
+
+Technisch werden Lesefehler pro Bereich gesammelt:
+
+- `read_errors` enthaelt die betroffenen Tabellen oder Pruefschritte.
+- `partial: true` kennzeichnet Analyse-, Entity- oder Importergebnisse, die nur
+  aus den lesbaren Bereichen stammen.
+- `source_warnings` wird in Import-Reports uebernommen, wenn die Quelle
+  Integritaetswarnungen hatte.
+
+Entity- und Statistiklisten verwenden Metadaten-Tabellen wie `states_meta` und
+`statistics_meta` als Fallback. Wenn ein aggregierter Scan ueber `states`,
+`statistics_short_term` oder `statistics` fehlschlaegt, koennen dadurch trotzdem
+noch vorhandene Entitaeten angezeigt und gezielt importiert werden.
+
+Grenze dieses Modus: Wenn SQLite eine defekte Datenpage waehrend eines Scans
+meldet, kann die App den Scan an dieser Stelle sauber beenden und bereits
+gelesene Zeilen verwenden. Sie kann aber keine physisch nicht mehr lesbaren
+Zeilen rekonstruieren.
+
 Bei Uploads zeigt die UI den Browser-Uploadfortschritt an. Fuer serverseitige
 Aktionen wie Backup-Extraktion, Cache-Aktualisierung und Import wird ein
 Arbeitsstatus mit Ablauf-Log angezeigt. Serverseitige Langlaeufer werden als Jobs
