@@ -259,6 +259,12 @@ h3 {
   font-weight: 700;
 }
 
+.progress-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .progress-track {
   height: 10px;
   overflow: hidden;

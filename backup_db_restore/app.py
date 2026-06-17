@@ -33,6 +33,7 @@ REPORT_DIR = DATA_DIR / "import-reports"
 DIAGNOSTIC_DIR = DATA_DIR / "diagnostics"
 
 OPTIONS_PATH = DATA_DIR / "options.json"
+JOBS_PATH = DATA_DIR / "jobs.json"
 SOURCE_DB = CACHE_DIR / "source.db"
 SOURCE_ORIGINAL = CACHE_DIR / "source_original"
 SOURCE_META = CACHE_DIR / "source_meta.json"
@@ -40,6 +41,10 @@ STATISTICS_TABLES = ("statistics_short_term", "statistics")
 BACKUP_FILE_EXTENSIONS = (".backup", ".tar", ".tar.gz", ".tgz", ".db", ".sqlite", ".sqlite3")
 JOB_LOG_LIMIT = 300
 JOB_RETENTION_SECONDS = 6 * 60 * 60
+ACTIVE_JOB_STATUSES = {"queued", "running", "cancelling"}
+TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled"}
+SOURCE_CACHE_JOB_KINDS = {"upload", "load_backup", "load_corrupt_database", "refresh_cache"}
+SOURCE_READER_JOB_KINDS = {"import"}
 
 DEFAULT_OPTIONS = {
     "database_path": "/homeassistant_config/home-assistant_v2.db",
@@ -53,10 +58,15 @@ JOBS: dict[str, dict[str, Any]] = {}
 
 
 class AppError(Exception):
-    def __init__(self, message: str, status: int = HTTPStatus.BAD_REQUEST) -> None:
+    def __init__(self, message: str, status: int = HTTPStatus.BAD_REQUEST, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.status = status
+        self.details = details or {}
+
+
+class JobCancelled(Exception):
+    pass
 
 
 def public_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -68,10 +78,106 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "progress": job["progress"],
         "created_at": job["created_at"],
         "updated_at": job["updated_at"],
+        "finished_at": job.get("finished_at"),
+        "cancel_requested": bool(job.get("cancel_requested", False)),
         "logs": list(job["logs"]),
         "result": job.get("result"),
         "error": job.get("error"),
     }
+
+
+def app_error_payload(err: AppError) -> dict[str, Any]:
+    payload = {"error": err.message}
+    payload.update(err.details)
+    return payload
+
+
+def persisted_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": job["id"],
+        "kind": job["kind"],
+        "title": job["title"],
+        "status": job["status"],
+        "progress": job["progress"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+        "finished_at": job.get("finished_at"),
+        "cancel_requested": bool(job.get("cancel_requested", False)),
+        "logs": list(job.get("logs", []))[-JOB_LOG_LIMIT:],
+        "result": job.get("result"),
+        "error": job.get("error"),
+    }
+
+
+def persist_jobs_locked() -> None:
+    payload = {
+        "version": 1,
+        "updated_at": now_iso(),
+        "jobs": [persisted_job(job) for job in sorted(JOBS.values(), key=lambda item: item["created_at"])],
+    }
+    temp_path: Path | None = None
+    try:
+        JOBS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = JOBS_PATH.with_name(f".{JOBS_PATH.name}.{uuid.uuid4().hex}.tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, default=json_default)
+        temp_path.replace(JOBS_PATH)
+    except (OSError, TypeError, ValueError):
+        if temp_path:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def load_persisted_jobs() -> None:
+    if not JOBS_PATH.exists():
+        return
+    try:
+        with JOBS_PATH.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    raw_jobs = payload.get("jobs", []) if isinstance(payload, dict) else payload
+    if not isinstance(raw_jobs, list):
+        return
+
+    loaded: dict[str, dict[str, Any]] = {}
+    restart_time = now_iso()
+    for raw_job in raw_jobs:
+        if not isinstance(raw_job, dict) or not raw_job.get("id"):
+            continue
+        job = {
+            "id": str(raw_job.get("id")),
+            "kind": str(raw_job.get("kind") or "unknown"),
+            "title": str(raw_job.get("title") or "Job"),
+            "status": str(raw_job.get("status") or "failed"),
+            "progress": max(0, min(100, int(raw_job.get("progress") or 0))),
+            "created_at": str(raw_job.get("created_at") or restart_time),
+            "updated_at": str(raw_job.get("updated_at") or restart_time),
+            "finished_at": raw_job.get("finished_at"),
+            "cancel_requested": bool(raw_job.get("cancel_requested", False)),
+            "logs": list(raw_job.get("logs") or [])[-JOB_LOG_LIMIT:],
+            "result": raw_job.get("result"),
+            "error": raw_job.get("error"),
+        }
+        if job["status"] in ACTIVE_JOB_STATUSES:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            job["status"] = "failed"
+            job["progress"] = 100
+            job["cancel_requested"] = False
+            job["error"] = "Job wurde durch einen Server-Neustart unterbrochen."
+            job["updated_at"] = restart_time
+            job["finished_at"] = restart_time
+            job["logs"].append(f"[{timestamp}] Server-Neustart erkannt. Job als unterbrochen markiert.")
+        if job["status"] in TERMINAL_JOB_STATUSES:
+            job["finished_monotonic"] = time.time()
+        loaded[job["id"]] = job
+
+    with JOB_LOCK:
+        JOBS.update(loaded)
+        persist_jobs_locked()
 
 
 def cleanup_jobs() -> None:
@@ -80,10 +186,12 @@ def cleanup_jobs() -> None:
         stale = [
             job_id
             for job_id, job in JOBS.items()
-            if job["status"] in {"succeeded", "failed"} and job.get("finished_monotonic", time.time()) < cutoff
+            if job["status"] in TERMINAL_JOB_STATUSES and job.get("finished_monotonic", time.time()) < cutoff
         ]
         for job_id in stale:
             JOBS.pop(job_id, None)
+        if stale:
+            persist_jobs_locked()
 
 
 def get_job(job_id: str) -> dict[str, Any]:
@@ -92,6 +200,75 @@ def get_job(job_id: str) -> dict[str, Any]:
         job = JOBS.get(job_id)
         if not job:
             raise AppError("Job was not found.", HTTPStatus.NOT_FOUND)
+        return public_job(job)
+
+
+def active_job() -> dict[str, Any] | None:
+    cleanup_jobs()
+    with JOB_LOCK:
+        candidates = [job for job in JOBS.values() if job["status"] in ACTIVE_JOB_STATUSES]
+        if not candidates:
+            return None
+        newest = max(candidates, key=lambda item: item["updated_at"])
+        return public_job(newest)
+
+
+def conflicting_job_locked(kind: str) -> dict[str, Any] | None:
+    if kind in SOURCE_CACHE_JOB_KINDS:
+        conflicting_kinds = SOURCE_CACHE_JOB_KINDS | SOURCE_READER_JOB_KINDS
+    elif kind in SOURCE_READER_JOB_KINDS:
+        conflicting_kinds = SOURCE_CACHE_JOB_KINDS
+    else:
+        return None
+    for job in JOBS.values():
+        if job["kind"] in conflicting_kinds and job["status"] in ACTIVE_JOB_STATUSES:
+            return public_job(job)
+    return None
+
+
+def raise_job_conflict(conflict: dict[str, Any]) -> None:
+    raise AppError(
+        "Es laeuft bereits ein Job, der den Quell-Cache verwendet.",
+        HTTPStatus.CONFLICT,
+        {"active_job": conflict},
+    )
+
+
+def ensure_no_conflicting_job(kind: str) -> None:
+    cleanup_jobs()
+    with JOB_LOCK:
+        conflict = conflicting_job_locked(kind)
+        if conflict:
+            raise_job_conflict(conflict)
+
+
+def raise_if_cancelled(job_id: str) -> None:
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if job and job.get("cancel_requested"):
+            if job["status"] in {"queued", "running"}:
+                job["status"] = "cancelling"
+                job["updated_at"] = now_iso()
+                persist_jobs_locked()
+            raise JobCancelled()
+
+
+def request_job_cancel(job_id: str) -> dict[str, Any]:
+    cleanup_jobs()
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise AppError("Job was not found.", HTTPStatus.NOT_FOUND)
+        if job["status"] in TERMINAL_JOB_STATUSES:
+            return public_job(job)
+        job["cancel_requested"] = True
+        if job["status"] in {"queued", "running"}:
+            job["status"] = "cancelling"
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        if not job["logs"] or "Abbruch angefordert." not in job["logs"][-1]:
+            job["logs"].append(f"[{timestamp}] Abbruch angefordert.")
+        job["updated_at"] = now_iso()
+        persist_jobs_locked()
         return public_job(job)
 
 
@@ -110,6 +287,7 @@ def update_job(job_id: str, *, progress: int | None = None, status: str | None =
             if len(job["logs"]) > JOB_LOG_LIMIT:
                 job["logs"] = job["logs"][-JOB_LOG_LIMIT:]
         job["updated_at"] = now_iso()
+        persist_jobs_locked()
 
 
 def start_job(kind: str, title: str, worker: Any, *args: Any) -> dict[str, Any]:
@@ -123,12 +301,17 @@ def start_job(kind: str, title: str, worker: Any, *args: Any) -> dict[str, Any]:
         "progress": 0,
         "created_at": now_iso(),
         "updated_at": now_iso(),
+        "cancel_requested": False,
         "logs": [],
         "result": None,
         "error": None,
     }
     with JOB_LOCK:
+        conflict = conflicting_job_locked(kind)
+        if conflict:
+            raise_job_conflict(conflict)
         JOBS[job_id] = job
+        persist_jobs_locked()
 
     thread = threading.Thread(target=run_job, args=(job_id, worker, args), daemon=True)
     thread.start()
@@ -138,6 +321,7 @@ def start_job(kind: str, title: str, worker: Any, *args: Any) -> dict[str, Any]:
 def run_job(job_id: str, worker: Any, args: tuple[Any, ...]) -> None:
     update_job(job_id, status="running", progress=1, message="Job gestartet.")
     try:
+        raise_if_cancelled(job_id)
         result = worker(job_id, *args)
         with JOB_LOCK:
             job = JOBS[job_id]
@@ -145,9 +329,22 @@ def run_job(job_id: str, worker: Any, args: tuple[Any, ...]) -> None:
             job["progress"] = 100
             job["result"] = result
             job["updated_at"] = now_iso()
+            job["finished_at"] = now_iso()
             job["finished_monotonic"] = time.time()
             timestamp = datetime.now().strftime("%H:%M:%S")
             job["logs"].append(f"[{timestamp}] Job abgeschlossen.")
+            persist_jobs_locked()
+    except JobCancelled:
+        with JOB_LOCK:
+            job = JOBS[job_id]
+            job["status"] = "cancelled"
+            job["progress"] = 100
+            job["updated_at"] = now_iso()
+            job["finished_at"] = now_iso()
+            job["finished_monotonic"] = time.time()
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            job["logs"].append(f"[{timestamp}] Job abgebrochen.")
+            persist_jobs_locked()
     except AppError as err:
         with JOB_LOCK:
             job = JOBS[job_id]
@@ -155,9 +352,11 @@ def run_job(job_id: str, worker: Any, args: tuple[Any, ...]) -> None:
             job["progress"] = 100
             job["error"] = err.message
             job["updated_at"] = now_iso()
+            job["finished_at"] = now_iso()
             job["finished_monotonic"] = time.time()
             timestamp = datetime.now().strftime("%H:%M:%S")
             job["logs"].append(f"[{timestamp}] Fehler: {err.message}")
+            persist_jobs_locked()
     except Exception as err:
         with JOB_LOCK:
             job = JOBS[job_id]
@@ -165,9 +364,11 @@ def run_job(job_id: str, worker: Any, args: tuple[Any, ...]) -> None:
             job["progress"] = 100
             job["error"] = str(err)
             job["updated_at"] = now_iso()
+            job["finished_at"] = now_iso()
             job["finished_monotonic"] = time.time()
             timestamp = datetime.now().strftime("%H:%M:%S")
             job["logs"].append(f"[{timestamp}] Fehler: {err}")
+            persist_jobs_locked()
 
 
 def ensure_dirs() -> None:
@@ -1141,9 +1342,33 @@ def list_current_entities() -> dict[str, Any]:
     }
 
 
-def copy_stream(source: Any, destination: Path) -> None:
+def check_cancel(cancel_callback: Any = None) -> None:
+    if cancel_callback:
+        cancel_callback()
+
+
+def copy_stream(source: Any, destination: Path, cancel_callback: Any = None) -> None:
     with destination.open("wb") as output:
-        shutil.copyfileobj(source, output, length=1024 * 1024)
+        while True:
+            check_cancel(cancel_callback)
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            output.write(chunk)
+
+
+def copy_path(source: Path, destination: Path, cancel_callback: Any = None) -> None:
+    with source.open("rb") as input_file, destination.open("wb") as output:
+        while True:
+            check_cancel(cancel_callback)
+            chunk = input_file.read(1024 * 1024)
+            if not chunk:
+                break
+            output.write(chunk)
+    try:
+        shutil.copystat(source, destination)
+    except OSError:
+        pass
 
 
 def supported_backup_file(path: Path) -> bool:
@@ -1417,20 +1642,23 @@ def looks_like_nested_archive(member_name: str) -> bool:
     return normalized.endswith((".tar", ".tar.gz", ".tgz", ".backup"))
 
 
-def extract_database(upload_path: Path, target_path: Path, original_name: str) -> dict[str, Any]:
+def extract_database(upload_path: Path, target_path: Path, original_name: str, cancel_callback: Any = None) -> dict[str, Any]:
+    check_cancel(cancel_callback)
     if is_sqlite_file(upload_path):
-        shutil.copy2(upload_path, target_path)
+        copy_path(upload_path, target_path, cancel_callback)
         return {"kind": "sqlite", "selected_member": original_name}
 
     candidates: list[tuple[int, Path, str]] = []
 
     def scan_archive(path: Path, trail: str, depth: int, temp_root: Path) -> None:
+        check_cancel(cancel_callback)
         if depth > 3:
             return
         if not tarfile.is_tarfile(path):
             return
         with tarfile.open(path, "r:*") as archive:
             for member in archive.getmembers():
+                check_cancel(cancel_callback)
                 if not member.isfile():
                     continue
                 member_name = f"{trail}/{member.name}" if trail else member.name
@@ -1440,7 +1668,7 @@ def extract_database(upload_path: Path, target_path: Path, original_name: str) -
                     if extracted is None:
                         continue
                     candidate_path = temp_root / f"candidate_{len(candidates)}.db"
-                    copy_stream(extracted, candidate_path)
+                    copy_stream(extracted, candidate_path, cancel_callback)
                     if is_sqlite_file(candidate_path):
                         candidates.append((score, candidate_path, member_name))
                 elif looks_like_nested_archive(member.name):
@@ -1448,7 +1676,7 @@ def extract_database(upload_path: Path, target_path: Path, original_name: str) -
                     if extracted is None:
                         continue
                     nested_path = temp_root / f"nested_{depth}_{len(candidates)}.tar"
-                    copy_stream(extracted, nested_path)
+                    copy_stream(extracted, nested_path, cancel_callback)
                     scan_archive(nested_path, member_name, depth + 1, temp_root)
 
     with tempfile.TemporaryDirectory(dir=str(TMP_DIR)) as temp_dir:
@@ -1458,7 +1686,7 @@ def extract_database(upload_path: Path, target_path: Path, original_name: str) -
 
         candidates.sort(key=lambda item: (item[0], item[2]))
         _, selected_path, selected_member = candidates[0]
-        shutil.copy2(selected_path, target_path)
+        copy_path(selected_path, target_path, cancel_callback)
 
     return {"kind": "archive", "selected_member": selected_member}
 
@@ -1484,52 +1712,62 @@ def cache_source_file(
     source_kind: str,
     copy_original: bool,
     original_path: str | None = None,
+    cancel_callback: Any = None,
 ) -> dict[str, Any]:
     working_db = TMP_DIR / f"source_{int(time.time())}.db"
-    extract_info = extract_database(source_path, working_db, original_name)
-    analysis = analyze_database(working_db)
-    if not analysis["sqlite_header"]:
-        raise AppError("The extracted file is not a SQLite database.")
-
-    cleanup_source_database_files()
-    if copy_original:
-        shutil.copy2(source_path, SOURCE_ORIGINAL)
-    else:
-        try:
-            SOURCE_ORIGINAL.unlink()
-        except FileNotFoundError:
-            pass
-    shutil.copy2(working_db, SOURCE_DB)
+    staged_original = TMP_DIR / f"source_original_{int(time.time())}_{uuid.uuid4().hex}"
     try:
-        working_db.unlink()
-    except OSError:
-        pass
+        extract_info = extract_database(source_path, working_db, original_name, cancel_callback)
+        analysis = analyze_database(working_db)
+        if not analysis["sqlite_header"]:
+            raise AppError("The extracted file is not a SQLite database.")
 
-    entities = list_entities(SOURCE_DB, limit=None)
-    meta = {
-        "cached_at": now_iso(),
-        "source_kind": source_kind,
-        "original_name": original_name,
-        "original_path": original_path,
-        "extract": extract_info,
-        "analysis": analyze_database(SOURCE_DB),
-        "entities_count": len(entities),
-    }
-    write_source_meta(meta)
+        entities = list_entities(working_db, limit=None)
+        meta = {
+            "cached_at": now_iso(),
+            "source_kind": source_kind,
+            "original_name": original_name,
+            "original_path": original_path,
+            "extract": extract_info,
+            "analysis": analysis,
+            "entities_count": len(entities),
+        }
+        if copy_original:
+            copy_path(source_path, staged_original, cancel_callback)
 
-    return {"meta": meta, "entities": entities}
+        check_cancel(cancel_callback)
+        cleanup_source_database_files()
+        if copy_original:
+            staged_original.replace(SOURCE_ORIGINAL)
+        else:
+            try:
+                SOURCE_ORIGINAL.unlink()
+            except FileNotFoundError:
+                pass
+        working_db.replace(SOURCE_DB)
+        write_source_meta(meta)
+        return {"meta": meta, "entities": entities}
+    finally:
+        try:
+            working_db.unlink()
+        except OSError:
+            pass
+        try:
+            staged_original.unlink()
+        except OSError:
+            pass
 
 
-def copy_recovery_sidecars(source_path: Path) -> dict[str, dict[str, Any]]:
+def copy_recovery_sidecars(source_path: Path, destination_db: Path = SOURCE_DB, cancel_callback: Any = None) -> dict[str, dict[str, Any]]:
     copied: dict[str, dict[str, Any]] = {}
     destinations = {
-        "wal": Path(f"{SOURCE_DB}-wal"),
-        "shm": Path(f"{SOURCE_DB}-shm"),
-        "journal": Path(f"{SOURCE_DB}-journal"),
+        "wal": Path(f"{destination_db}-wal"),
+        "shm": Path(f"{destination_db}-shm"),
+        "journal": Path(f"{destination_db}-journal"),
     }
     for kind, sidecar in matching_corrupt_sidecars(source_path).items():
         destination = destinations[kind]
-        shutil.copy2(sidecar, destination)
+        copy_path(sidecar, destination, cancel_callback)
         copied[kind] = {
             "source": str(sidecar),
             "destination": str(destination),
@@ -1538,54 +1776,81 @@ def copy_recovery_sidecars(source_path: Path) -> dict[str, dict[str, Any]]:
     return copied
 
 
-def remove_source_sidecars() -> None:
-    for path in source_database_sidecar_paths():
+def sidecar_paths_for_database(database_path: Path) -> tuple[Path, Path, Path]:
+    return (Path(f"{database_path}-wal"), Path(f"{database_path}-shm"), Path(f"{database_path}-journal"))
+
+
+def remove_source_sidecars(database_path: Path = SOURCE_DB) -> None:
+    for path in sidecar_paths_for_database(database_path):
         try:
             path.unlink()
         except FileNotFoundError:
             pass
 
 
-def cache_corrupt_database(file_id: str) -> dict[str, Any]:
-    source_path = resolve_corrupt_database(file_id)
-    cleanup_source_database_files(include_meta=True)
-    shutil.copy2(source_path, SOURCE_DB)
-    copied_sidecars = copy_recovery_sidecars(source_path)
-
-    analysis = analyze_database(SOURCE_DB)
-    warnings: list[str] = []
-    used_sidecars = copied_sidecars
-    if copied_sidecars and not analysis.get("readable", False):
-        warnings.append("Quelle war mit WAL/SHM-Sidecars nicht lesbar. Es wurde automatisch ohne Sidecars erneut versucht.")
-        remove_source_sidecars()
-        used_sidecars = {}
-        analysis = analyze_database(SOURCE_DB)
-
-    if not analysis["sqlite_header"]:
-        raise AppError("Selected corrupt database is not a SQLite database.")
-    if not analysis.get("readable", analysis.get("ok", False)):
-        raise AppError(analysis.get("error") or "Selected corrupt database is not readable enough for rescue.")
-
-    entities = list_entities(SOURCE_DB, limit=None)
-    meta = {
-        "cached_at": now_iso(),
-        "source_kind": "corrupt_database",
-        "original_name": source_path.name,
-        "original_path": str(source_path),
-        "recovery_sidecars": used_sidecars,
-        "recovery_warnings": warnings,
-        "analysis": analysis,
-        "entities_count": len(entities),
+def final_sidecar_info(copied_sidecars: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    final_paths = {
+        "wal": Path(f"{SOURCE_DB}-wal"),
+        "shm": Path(f"{SOURCE_DB}-shm"),
+        "journal": Path(f"{SOURCE_DB}-journal"),
     }
-    write_source_meta(meta)
-    return {"meta": meta, "entities": entities}
+    return {
+        kind: {
+            "source": info.get("source"),
+            "destination": str(final_paths[kind]),
+            "size_bytes": info.get("size_bytes"),
+        }
+        for kind, info in copied_sidecars.items()
+    }
 
 
-def handle_uploaded_file(upload_path: Path, original_name: str) -> dict[str, Any]:
-    return cache_source_file(upload_path, original_name, "upload", copy_original=True)
+def cache_corrupt_database(file_id: str, cancel_callback: Any = None) -> dict[str, Any]:
+    source_path = resolve_corrupt_database(file_id)
+    with tempfile.TemporaryDirectory(dir=str(TMP_DIR)) as temp_dir:
+        staged_db = Path(temp_dir) / "source.db"
+        copy_path(source_path, staged_db, cancel_callback)
+        copied_sidecars = copy_recovery_sidecars(source_path, staged_db, cancel_callback)
+
+        analysis = analyze_database(staged_db)
+        warnings: list[str] = []
+        used_sidecars = copied_sidecars
+        if copied_sidecars and not analysis.get("readable", False):
+            warnings.append("Quelle war mit WAL/SHM-Sidecars nicht lesbar. Es wurde automatisch ohne Sidecars erneut versucht.")
+            remove_source_sidecars(staged_db)
+            used_sidecars = {}
+            analysis = analyze_database(staged_db)
+
+        if not analysis["sqlite_header"]:
+            raise AppError("Selected corrupt database is not a SQLite database.")
+        if not analysis.get("readable", analysis.get("ok", False)):
+            raise AppError(analysis.get("error") or "Selected corrupt database is not readable enough for rescue.")
+
+        entities = list_entities(staged_db, limit=None)
+        meta = {
+            "cached_at": now_iso(),
+            "source_kind": "corrupt_database",
+            "original_name": source_path.name,
+            "original_path": str(source_path),
+            "recovery_sidecars": final_sidecar_info(used_sidecars),
+            "recovery_warnings": warnings,
+            "analysis": analysis,
+            "entities_count": len(entities),
+        }
+
+        check_cancel(cancel_callback)
+        cleanup_source_database_files(include_meta=True)
+        staged_db.replace(SOURCE_DB)
+        for kind, info in used_sidecars.items():
+            Path(str(info["destination"])).replace(Path(f"{SOURCE_DB}-{kind}"))
+        write_source_meta(meta)
+        return {"meta": meta, "entities": entities}
 
 
-def handle_device_backup_file(file_id: str) -> dict[str, Any]:
+def handle_uploaded_file(upload_path: Path, original_name: str, cancel_callback: Any = None) -> dict[str, Any]:
+    return cache_source_file(upload_path, original_name, "upload", copy_original=True, cancel_callback=cancel_callback)
+
+
+def handle_device_backup_file(file_id: str, cancel_callback: Any = None) -> dict[str, Any]:
     backup_path = resolve_device_backup(file_id)
     return cache_source_file(
         backup_path,
@@ -1593,6 +1858,7 @@ def handle_device_backup_file(file_id: str) -> dict[str, Any]:
         "device_backup",
         copy_original=False,
         original_path=str(backup_path),
+        cancel_callback=cancel_callback,
     )
 
 
@@ -1854,6 +2120,7 @@ class HistoryImporter:
         end: Any = None,
         duplicate_strategy: str = "skip",
         progress_callback: Any = None,
+        cancel_callback: Any = None,
     ) -> None:
         self.source_db = source_db
         self.target_db = target_db
@@ -1865,10 +2132,15 @@ class HistoryImporter:
         self.end = end
         self.duplicate_strategy = duplicate_strategy if duplicate_strategy in {"skip", "replace"} else "skip"
         self.progress_callback = progress_callback
+        self.cancel_callback = cancel_callback
         self.attribute_map: dict[int, int | None] = {}
         self.source_warnings: list[str] = []
 
+    def check_cancelled(self) -> None:
+        check_cancel(self.cancel_callback)
+
     def run(self) -> dict[str, Any]:
+        self.check_cancelled()
         if not self.source_db.exists():
             raise AppError("No cached source database is available. Upload or cache a database first.")
         if not self.target_db.exists():
@@ -1886,11 +2158,13 @@ class HistoryImporter:
             self.source_warnings = list(source_analysis.get("read_errors") or [])
         if not target_analysis["sqlite_header"] or not target_analysis["ok"]:
             raise AppError("Current database is not healthy enough for import.")
+        self.check_cancelled()
 
         with open_db(self.source_db, readonly=True) as source_conn:
             source_entities = {item["entity_id"] for item in list_entities(self.source_db, limit=None)}
             if self.source_entity not in source_entities:
                 raise AppError("Source entity was not found in the cached database.")
+            self.check_cancelled()
 
             if self.dry_run:
                 with open_db(self.target_db, readonly=True) as target_conn:
@@ -1903,11 +2177,13 @@ class HistoryImporter:
             options = read_options()
             if bool(options.get("create_current_db_backup", True)):
                 backup_path = backup_current_database(self.target_db)
+            self.check_cancelled()
 
             with open_db(self.target_db, readonly=False, timeout=30) as target_conn:
                 target_conn.execute("PRAGMA busy_timeout = 30000")
                 target_conn.execute("BEGIN IMMEDIATE")
                 try:
+                    self.check_cancelled()
                     target_metadata_id = ensure_target_metadata(target_conn, self.target_entity)
                     result = self.copy_states(source_conn, target_conn, target_metadata_id)
                     if self.include_statistics:
@@ -1968,6 +2244,8 @@ class HistoryImporter:
 
         for source_row in query_rows_best_effort(source_conn, source_sql, query_params, read_errors, "states"):
             scanned += 1
+            if scanned == 1 or scanned % 1000 == 0:
+                self.check_cancelled()
             duplicate = self.is_duplicate(target_conn, source_row, target_metadata_id, target_state_names)
             if duplicate:
                 if self.duplicate_strategy == "skip":
@@ -2393,6 +2671,8 @@ class HistoryImporter:
 
         for source_row in query_rows_best_effort(source_conn, source_sql, query_params, read_errors, table):
             scanned += 1
+            if scanned == 1 or scanned % 1000 == 0:
+                self.check_cancelled()
             row_start = source_row[start_column]
             if target_metadata_id is not None and self.statistics_duplicate(target_conn, table, target_metadata_id, start_column, row_start):
                 if self.duplicate_strategy == "skip":
@@ -2481,6 +2761,7 @@ def import_history(
     payload: dict[str, Any],
     job_id: str | None = None,
     progress_callback: Any = None,
+    cancel_callback: Any = None,
     write_report: bool = True,
 ) -> dict[str, Any]:
     source_entity = str(payload.get("source_entity_id", "")).strip()
@@ -2512,6 +2793,7 @@ def import_history(
         end=end,
         duplicate_strategy=duplicate_strategy,
         progress_callback=progress_callback,
+        cancel_callback=cancel_callback,
     )
     result = importer.run()
     if write_report:
@@ -2630,26 +2912,31 @@ def mapping_suggestions(source_entity_id: str, limit: int = 8) -> dict[str, Any]
 def job_cache_uploaded_file(job_id: str, upload_path: Path, original_name: str) -> dict[str, Any]:
     update_job(job_id, progress=10, message="Upload gespeichert. Archiv/Datenbank wird durchsucht.")
     try:
-        result = handle_uploaded_file(upload_path, original_name)
+        raise_if_cancelled(job_id)
+        result = handle_uploaded_file(upload_path, original_name, cancel_callback=lambda: raise_if_cancelled(job_id))
     finally:
         try:
             upload_path.unlink()
         except OSError:
             pass
+    raise_if_cancelled(job_id)
     update_job(job_id, progress=85, message="Recorder-Datenbank analysiert und Cache aktualisiert.")
     return result
 
 
 def job_cache_device_backup(job_id: str, file_id: str) -> dict[str, Any]:
     update_job(job_id, progress=10, message=f"Backup wird gelesen: {file_id}")
-    result = handle_device_backup_file(file_id)
+    raise_if_cancelled(job_id)
+    result = handle_device_backup_file(file_id, cancel_callback=lambda: raise_if_cancelled(job_id))
+    raise_if_cancelled(job_id)
     update_job(job_id, progress=85, message="Recorder-Datenbank aus Backup extrahiert und analysiert.")
     return result
 
 
 def job_cache_corrupt_database(job_id: str, file_id: str) -> dict[str, Any]:
     update_job(job_id, progress=10, message=f"Defekte Recorder-DB wird zur Rettung geladen: {file_id}")
-    result = cache_corrupt_database(file_id)
+    raise_if_cancelled(job_id)
+    result = cache_corrupt_database(file_id, cancel_callback=lambda: raise_if_cancelled(job_id))
     meta = result.get("meta") or {}
     sidecars = meta.get("recovery_sidecars") or {}
     if sidecars:
@@ -2665,7 +2952,9 @@ def job_refresh_cached_database(job_id: str) -> dict[str, Any]:
     if not SOURCE_DB.exists():
         raise AppError("No cached database is available.")
     update_job(job_id, progress=20, message="Cache-Datenbank wird neu analysiert.")
+    raise_if_cancelled(job_id)
     entities = list_entities(SOURCE_DB, limit=None)
+    raise_if_cancelled(job_id)
     meta = read_source_meta() or {}
     meta.update({"cached_at": now_iso(), "analysis": analyze_database(SOURCE_DB), "entities_count": len(entities)})
     write_source_meta(meta)
@@ -2677,9 +2966,12 @@ def job_import_history(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     update_job(job_id, progress=5, message="Import-Vorabpruefung gestartet.")
 
     def progress(progress_value: int, message: str) -> None:
+        raise_if_cancelled(job_id)
         update_job(job_id, progress=progress_value, message=message)
 
-    result = import_history(payload, job_id=job_id, progress_callback=progress)
+    raise_if_cancelled(job_id)
+    result = import_history(payload, job_id=job_id, progress_callback=progress, cancel_callback=lambda: raise_if_cancelled(job_id))
+    raise_if_cancelled(job_id)
     update_job(job_id, progress=90, message="Import-Report geschrieben.")
     return result
 
@@ -2751,6 +3043,7 @@ def app_status() -> dict[str, Any]:
         },
         "cache": cache_status(),
         "current_database": analyze_database(current_db),
+        "active_job": active_job(),
     }
 
 
@@ -2830,7 +3123,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except AppError as err:
-            self.send_json({"error": err.message}, status=err.status)
+            self.send_json(app_error_payload(err), status=err.status)
         except Exception as err:
             self.log_error("Unhandled GET error: %s", err)
             self.send_json({"error": str(err)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -2845,7 +3138,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed_url.query)
             self.handle_upload(async_mode=query.get("async", ["0"])[0] in {"1", "true", "yes"})
         except AppError as err:
-            self.send_json({"error": err.message}, status=err.status)
+            self.send_json(app_error_payload(err), status=err.status)
         except Exception as err:
             self.log_error("Unhandled PUT error: %s", err)
             self.send_json({"error": str(err)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -2854,11 +3147,18 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             path = urllib.parse.urlparse(self.path).path
             if path == "/api/import":
+                ensure_no_conflicting_job("import")
                 self.send_json(import_history(self.read_json()))
             elif path == "/api/import/preview":
+                ensure_no_conflicting_job("import")
                 self.send_json(preflight_import(self.read_json()))
             elif path == "/api/jobs":
                 self.send_json(create_action_job(self.read_json()), status=HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/jobs/") and path.endswith("/cancel"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    raise AppError("Job was not found.", HTTPStatus.NOT_FOUND)
+                self.send_json(request_job_cancel(parts[2]))
             elif path == "/api/backups/load":
                 payload = self.read_json()
                 if bool(payload.get("async", False)):
@@ -2867,9 +3167,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                         status=HTTPStatus.ACCEPTED,
                     )
                 else:
+                    ensure_no_conflicting_job("load_backup")
                     result = handle_device_backup_file(str(payload.get("file_id", "")))
                     self.send_json(result)
             elif path == "/api/cache/refresh":
+                ensure_no_conflicting_job("refresh_cache")
                 if not SOURCE_DB.exists():
                     raise AppError("No cached database is available.")
                 entities = list_entities(SOURCE_DB, limit=None)
@@ -2878,6 +3180,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 write_source_meta(meta)
                 self.send_json({"meta": meta, "entities": entities})
             elif path == "/api/cache/clear":
+                ensure_no_conflicting_job("refresh_cache")
                 self.send_json(clear_cache())
             elif path == "/api/restore":
                 payload = self.read_json()
@@ -2887,12 +3190,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except AppError as err:
-            self.send_json({"error": err.message}, status=err.status)
+            self.send_json(app_error_payload(err), status=err.status)
         except Exception as err:
             self.log_error("Unhandled POST error: %s", err)
             self.send_json({"error": str(err)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def handle_upload(self, async_mode: bool = False) -> None:
+        ensure_no_conflicting_job("upload")
         options = read_options()
         max_bytes = int(options.get("max_upload_mb", 131072)) * 1024 * 1024
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -2967,6 +3271,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     ensure_dirs()
+    load_persisted_jobs()
     server = ThreadingHTTPServer(("0.0.0.0", 8099), RequestHandler)
     print("Backup DB Restore UI listening on :8099", flush=True)
     server.serve_forever()

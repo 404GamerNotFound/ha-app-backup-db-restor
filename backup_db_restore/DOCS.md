@@ -19,8 +19,8 @@ Instanz importiert werden kann.
 - `/share` ist read-write eingebunden und kann fuer manuelle Artefakte genutzt werden.
 - `/homeassistant_config` ist read-write eingebunden, damit History-Daten in die
   aktuelle Recorder-Datenbank geschrieben werden koennen.
-- `/data` speichert Upload-Cache, Job-nahe Artefakte, Import-Reports und
-  Sicherheitskopien persistent.
+- `/data` speichert Upload-Cache, Job-nahe Artefakte, Job-Status in
+  `jobs.json`, Import-Reports und Sicherheitskopien persistent.
 
 ## Importverhalten
 
@@ -106,7 +106,25 @@ Bei Uploads zeigt die UI den Browser-Uploadfortschritt an. Fuer serverseitige
 Aktionen wie Backup-Extraktion, Cache-Aktualisierung und Import wird ein
 Arbeitsstatus mit Ablauf-Log angezeigt. Serverseitige Langlaeufer werden als Jobs
 ausgefuehrt und ueber `/api/jobs/{id}` gepollt. Jobs halten Status, Fortschritt,
-Logzeilen, Ergebnis oder Fehler fuer mehrere Stunden im Speicher.
+Logzeilen, Ergebnis oder Fehler fuer mehrere Stunden in `/data/jobs.json`.
+`/api/status` liefert den aktuellsten laufenden Job als `active_job`, sodass die
+UI nach einem Seiten-Reload wieder an laufende Upload-Analysen,
+Backup-Ladevorgaenge oder Rettungs-Jobs fuer defekte Recorder-DBs ankoppeln
+kann. Wenn der Server selbst neu startet, werden zuvor laufende Jobs beim Start
+als unterbrochen markiert, weil der Worker-Thread nicht fortgesetzt werden kann.
+
+Laufende Upload-, Backup-, Corrupt-DB-, Cache-Refresh- und Import-Jobs koennen
+ueber die UI oder `POST /api/jobs/{id}/cancel` kooperativ abgebrochen werden.
+Die Worker pruefen das Abbruchsignal an sicheren Punkten, z. B. vor dem
+Ersetzen des Quell-Caches und waehrend laengerer Import-Schleifen. Jobs, die den
+Quell-Cache schreiben, werden nicht parallel zu anderen Cache-Schreibern oder
+Import-Jobs gestartet; der Server antwortet in diesem Fall mit `409 Conflict`
+und dem laufenden `active_job`.
+
+Der Browser-Dateiupload selbst bleibt eine aktive HTTP-Verbindung. Ein Reload
+waehrend der eigentlichen Dateiuebertragung bricht diese Verbindung ab; eine
+echte Fortsetzung waehrend des Uploads benoetigt ein separates Chunk-/Resume-
+Protokoll und eine erneute Dateiauswahl im Browser.
 
 ## Restore aktueller DB-Sicherungen
 
@@ -155,6 +173,10 @@ Home-Assistant-Backup normalerweise die sicherste Loesung.
 - `POST /api/jobs`: startet Jobs fuer `load_backup`, `refresh_cache`, `import`
   `restore_current_db`, `snapshot_current_db` und `checkpoint_current_db`.
 - `GET /api/jobs/{id}`: liefert Status, Fortschritt, Log, Ergebnis oder Fehler.
+- `POST /api/jobs/{id}/cancel`: fordert den kooperativen Abbruch eines laufenden
+  Jobs an.
+- `GET /api/status`: liefert App-Status inklusive `active_job`, falls ein Job
+  gerade laeuft oder noch in der Warteschlange steht.
 - `POST /api/import/preview`: fuehrt eine read-only Vorabpruefung aus.
 - `GET /api/mapping/suggestions`: liefert Ziel-Entity-Vorschlaege.
 - `GET /api/current-db-backups`: listet automatisch erzeugte aktuelle-DB-Sicherungen.

@@ -18,6 +18,15 @@
   Fallback nur mit der Hauptdatenbank.
 - Beim Leeren oder Ersetzen des Quell-Caches werden auch alte
   `source.db-wal`, `source.db-shm` und `source.db-journal` Dateien entfernt.
+- Laufende Jobs werden ueber `/api/status` als `active_job` gemeldet, damit die
+  UI nach einem Seiten-Reload den Fortschritt und das Ablauf-Log wieder
+  aufgreifen kann.
+- Job-Metadaten werden in `/data/jobs.json` persistiert. Nach einem
+  Server-Neustart werden zuvor laufende Jobs als unterbrochen markiert.
+- Upload-, Backup-, Corrupt-DB-, Cache-Refresh- und Import-Jobs koennen jetzt
+  kooperativ abgebrochen werden.
+- Quell-Cache-Schreiber und Import-Jobs werden serverseitig gegeneinander
+  gesperrt, damit kein paralleler Job den geladenen Source-Cache ersetzt.
 
 ## 0.5.5
 

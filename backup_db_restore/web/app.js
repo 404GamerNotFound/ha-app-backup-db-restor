@@ -20,7 +20,12 @@ const state = {
   },
   activeTab: "analysis",
   status: null,
+  resumedJobId: null,
+  currentJobId: null,
 };
+
+const ACTIVE_JOB_STATUSES = ["queued", "running", "cancelling"];
+const CANCELLABLE_JOB_KINDS = ["upload", "load_backup", "load_corrupt_database", "refresh_cache", "import"];
 
 const $ = (id) => document.getElementById(id);
 
@@ -126,7 +131,9 @@ async function api(path, options = {}) {
   const response = await fetch(path, options);
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(payload.error || response.statusText);
+    const error = new Error(payload.error || response.statusText);
+    error.payload = payload;
+    throw error;
   }
   return payload;
 }
@@ -171,22 +178,132 @@ async function startJob(payload) {
   });
 }
 
+function jobStatusLabel(job) {
+  if (!job) return "Laeuft";
+  if (job.status === "cancelling") return "Abbruch laeuft";
+  return ACTIVE_JOB_STATUSES.includes(job.status) ? job.title : job.status;
+}
+
+function updateCancelButton(job) {
+  const button = $("cancelJobButton");
+  const canShow = job && CANCELLABLE_JOB_KINDS.includes(job.kind) && ACTIVE_JOB_STATUSES.includes(job.status);
+  button.hidden = !canShow;
+  if (!canShow) {
+    button.disabled = true;
+    button.textContent = "Abbrechen";
+    return;
+  }
+  button.disabled = job.status === "cancelling" || Boolean(job.cancel_requested);
+  button.textContent = button.disabled ? "Wird abgebrochen" : "Abbrechen";
+}
+
+async function cancelActiveJob() {
+  const jobId = state.currentJobId;
+  if (!jobId) return;
+  updateCancelButton({ id: jobId, kind: "import", status: "cancelling", cancel_requested: true });
+  try {
+    const job = await api(`api/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+    renderJobLog(job);
+    setProgress(job.progress || 0, jobStatusLabel(job));
+    updateCancelButton(job);
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+function handleOperationError(error, resultElement = null) {
+  if (error?.cancelled) {
+    setProgress(0, "Abgebrochen");
+    appendLog("Job abgebrochen.");
+    if (resultElement) {
+      resultElement.textContent = "Job abgebrochen.";
+    }
+    toast("Job abgebrochen", "warn");
+    return;
+  }
+  setProgress(0, "Fehler");
+  appendLog(`Fehler: ${error.message}`);
+  if (error.payload?.active_job) {
+    appendLog(`Aktiver Job: ${error.payload.active_job.title} (${error.payload.active_job.status})`);
+  }
+  if (resultElement) {
+    resultElement.textContent = error.message;
+  }
+  toast(error.message, "error");
+}
+
 async function waitForJob(job) {
   let current = job;
-  while (true) {
-    const statusLabel = current.status === "running" ? current.title : current.status;
-    setProgress(current.progress || 0, statusLabel || "Laeuft");
-    renderJobLog(current);
-    if (current.status === "succeeded") {
-      finishProgress("Fertig");
-      return current.result;
+  state.currentJobId = current.id;
+  try {
+    while (true) {
+      setProgress(current.progress || 0, jobStatusLabel(current));
+      renderJobLog(current);
+      updateCancelButton(current);
+      if (current.status === "succeeded") {
+        finishProgress("Fertig");
+        return current.result;
+      }
+      if (current.status === "cancelled") {
+        const error = new Error("Job abgebrochen");
+        error.cancelled = true;
+        throw error;
+      }
+      if (current.status === "failed") {
+        setProgress(0, "Fehler");
+        throw new Error(current.error || "Job fehlgeschlagen");
+      }
+      await sleep(700);
+      current = await api(`api/jobs/${encodeURIComponent(current.id)}`);
     }
-    if (current.status === "failed") {
-      setProgress(0, "Fehler");
-      throw new Error(current.error || "Job fehlgeschlagen");
+  } finally {
+    if (state.currentJobId === job.id) {
+      state.currentJobId = null;
     }
-    await sleep(700);
-    current = await api(`api/jobs/${encodeURIComponent(current.id)}`);
+    updateCancelButton(null);
+  }
+}
+
+function completionMessage(job) {
+  if (!job) return "Job abgeschlossen";
+  const messages = {
+    upload: "Upload analysiert und zwischengespeichert",
+    load_backup: "Backup analysiert und zwischengespeichert",
+    load_corrupt_database: "Defekte DB als Quelle geladen. Entitaeten koennen jetzt importiert werden.",
+    refresh_cache: "Zwischenspeicher aktualisiert",
+    import: "Import abgeschlossen",
+    restore_current_db: "Aktuelle DB wiederhergestellt",
+    snapshot_current_db: "Snapshot der aktuellen DB erstellt",
+    checkpoint_current_db: "Passiver WAL-Checkpoint abgeschlossen",
+  };
+  return messages[job.kind] || `${job.title || "Job"} abgeschlossen`;
+}
+
+async function resumeActiveJob(job) {
+  if (!job || !ACTIVE_JOB_STATUSES.includes(job.status) || state.resumedJobId === job.id) {
+    return;
+  }
+
+  state.resumedJobId = job.id;
+  setBusy(true);
+  clearOperationLog();
+  setProgress(job.progress || 0, job.title || "Job wird fortgesetzt");
+  renderJobLog(job);
+  toast(`${job.title || "Job"} wird fortgesetzt`, "info");
+
+  try {
+    await waitForJob(job);
+    state.sourcePage.offset = 0;
+    await refreshStatus();
+    if (job.kind === "load_corrupt_database") {
+      setActiveTab("import");
+    }
+    toast(completionMessage(job), "success");
+  } catch (error) {
+    handleOperationError(error);
+  } finally {
+    state.resumedJobId = null;
+    setBusy(false);
   }
 }
 
@@ -555,9 +672,7 @@ async function uploadSelectedFile() {
     await refreshStatus();
     toast("Upload analysiert und zwischengespeichert", "success");
   } catch (error) {
-    setProgress(0, "Fehler");
-    appendLog(`Fehler: ${error.message}`);
-    toast(error.message, "error");
+    handleOperationError(error);
   } finally {
     setBusy(false);
   }
@@ -580,9 +695,7 @@ async function loadDeviceBackup() {
     await refreshStatus();
     toast("Backup analysiert und zwischengespeichert", "success");
   } catch (error) {
-    setProgress(0, "Fehler");
-    appendLog(`Fehler: ${error.message}`);
-    toast(error.message, "error");
+    handleOperationError(error);
   } finally {
     setBusy(false);
   }
@@ -606,9 +719,7 @@ async function loadCorruptDatabase() {
     setActiveTab("import");
     toast("Defekte DB als Quelle geladen. Entitaeten koennen jetzt importiert werden.", "success");
   } catch (error) {
-    setProgress(0, "Fehler");
-    appendLog(`Fehler: ${error.message}`);
-    toast(error.message, "error");
+    handleOperationError(error);
   } finally {
     setBusy(false);
   }
@@ -625,9 +736,7 @@ async function refreshCache() {
     await refreshStatus();
     toast("Zwischenspeicher aktualisiert", "success");
   } catch (error) {
-    setProgress(0, "Fehler");
-    appendLog(`Fehler: ${error.message}`);
-    toast(error.message, "error");
+    handleOperationError(error);
   } finally {
     setBusy(false);
   }
@@ -703,10 +812,7 @@ async function previewImport() {
     finishProgress("Pruefung fertig");
     toast("Vorabpruefung abgeschlossen", "success");
   } catch (error) {
-    setProgress(0, "Fehler");
-    appendLog(`Fehler: ${error.message}`);
-    $("importResult").textContent = error.message;
-    toast(error.message, "error");
+    handleOperationError(error, $("importResult"));
   } finally {
     setBusy(false);
   }
@@ -737,10 +843,7 @@ async function runImport() {
     await refreshStatus();
     toast("Import abgeschlossen", "success");
   } catch (error) {
-    setProgress(0, "Fehler");
-    appendLog(`Fehler: ${error.message}`);
-    $("importResult").textContent = error.message;
-    toast(error.message, "error");
+    handleOperationError(error, $("importResult"));
   } finally {
     setBusy(false);
   }
@@ -767,9 +870,7 @@ async function restoreCurrentDb() {
     await refreshStatus();
     toast("Aktuelle DB wiederhergestellt. Home Assistant Neustart empfohlen.", "success");
   } catch (error) {
-    setProgress(0, "Fehler");
-    appendLog(`Fehler: ${error.message}`);
-    toast(error.message, "error");
+    handleOperationError(error);
   } finally {
     setBusy(false);
   }
@@ -785,9 +886,7 @@ async function reanalyzeCurrentDb() {
     finishProgress("Pruefung fertig");
     toast("Aktuelle DB neu geprueft", "success");
   } catch (error) {
-    setProgress(0, "Fehler");
-    appendLog(`Fehler: ${error.message}`);
-    toast(error.message, "error");
+    handleOperationError(error);
   } finally {
     setBusy(false);
   }
@@ -805,9 +904,7 @@ async function snapshotCurrentDb() {
     appendLog(`Snapshot erstellt: ${result.snapshot_path}`);
     toast("Aktuelle DB-Snapshot erstellt und analysiert", "success");
   } catch (error) {
-    setProgress(0, "Fehler");
-    appendLog(`Fehler: ${error.message}`);
-    toast(error.message, "error");
+    handleOperationError(error);
   } finally {
     setBusy(false);
   }
@@ -829,9 +926,7 @@ async function checkpointCurrentDb() {
     $("currentDbDiagnosticsDetails").textContent = JSON.stringify(result, null, 2);
     toast("Passiver WAL-Checkpoint abgeschlossen", "success");
   } catch (error) {
-    setProgress(0, "Fehler");
-    appendLog(`Fehler: ${error.message}`);
-    toast(error.message, "error");
+    handleOperationError(error);
   } finally {
     setBusy(false);
     renderCurrentDbDiagnostics(state.status?.current_database);
@@ -855,6 +950,7 @@ async function openSelectedReport() {
 function bindEvents() {
   $("analysisTabButton").addEventListener("click", () => setActiveTab("analysis"));
   $("importTabButton").addEventListener("click", () => setActiveTab("import"));
+  $("cancelJobButton").addEventListener("click", cancelActiveJob);
   $("uploadButton").addEventListener("click", uploadSelectedFile);
   $("cacheButton").addEventListener("click", refreshCache);
   $("clearCacheButton").addEventListener("click", clearCache);
@@ -918,8 +1014,17 @@ function bindEvents() {
   $("importButton").addEventListener("click", runImport);
 }
 
+async function initialize() {
+  refreshBackups().catch((error) => toast(error.message, "error"));
+  refreshCorruptDatabases().catch((error) => toast(error.message, "error"));
+  try {
+    await refreshStatus();
+    await resumeActiveJob(state.status?.active_job);
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
 setActiveTab(window.location.hash === "#import" ? "import" : "analysis", false);
 bindEvents();
-refreshBackups();
-refreshCorruptDatabases();
-refreshStatus().catch((error) => toast(error.message, "error"));
+initialize();

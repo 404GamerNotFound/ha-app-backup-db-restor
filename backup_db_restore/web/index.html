@@ -24,7 +24,10 @@
       <section class="progress-panel" aria-label="Fortschritt">
         <div class="progress-header">
           <h2>Fortschritt</h2>
-          <span id="progressStatus">Bereit</span>
+          <div class="progress-actions">
+            <span id="progressStatus">Bereit</span>
+            <button id="cancelJobButton" class="secondary small" type="button" hidden>Abbrechen</button>
+          </div>
         </div>
         <div id="progressTrack" class="progress-track">
           <div id="progressBar" class="progress-bar"></div>

@@ -16,7 +16,7 @@ importiert werden.
 - Import von State-History mit Quell-/Ziel-Entity-Mapping.
 - Optionaler Import von Long-Term-Statistics.
 - Vorabpruefung, Zeitfenster, Duplikatstrategie und Mapping-Vorschlaege.
-- Serverseitige Jobs mit Fortschritt und Ablauf-Log.
+- Serverseitige Jobs mit persistiertem Fortschritt, Ablauf-Log und Abbruch.
 - Automatische aktuelle-DB-Sicherungen, Restore-Funktion und Import-Reports.
 
 ## Dateien
