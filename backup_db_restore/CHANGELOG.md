@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.7
+
+- Corrupt-DB-Auswahl im Import-Tab um Filter und Paging erweitert, damit viele
+  `*.corrupt` Dateien besser handhabbar sind.
+- Upload-Zeile zeigt jetzt direkt den ausgewaehlten Dateinamen und die Groesse.
+- Neue Detailkarte `Geladene Quelle` zeigt Typ, Name, Pfad, Archiv-Mitglied,
+  Sidecars, Warnungen und Cache-Zeit der aktuell geladenen Quell-DB.
+- Importformular zeigt eine Bereitschaftsanzeige mit den noch fehlenden
+  Angaben, bevor eine Vorabpruefung oder ein Schreibimport gestartet wird.
+- Mapping-Vorschlaege zeigen nun einen Leerzustand und enthalten Tooltip-Grund
+  fuer passende Ziel-Entitaeten.
+- Der Webserver-Port kann fuer lokale Tests per `BACKUP_DB_RESTORE_PORT`
+  ueberschrieben werden; im Add-on bleibt der Standard `8099`.
+
 ## 0.5.6
 
 - Lokale Home-Assistant-Corrupt-Dateien im Verzeichnis der konfigurierten

@@ -97,6 +97,7 @@
           <button id="uploadButton" type="button">Analysieren</button>
           <button id="cacheButton" type="button">Zwischenspeichern</button>
           <button id="clearCacheButton" class="secondary" type="button">Cache leeren</button>
+          <span id="uploadFileInfo" class="muted-line">Keine Datei ausgewaehlt</span>
         </section>
 
         <section class="toolbar device-backups" aria-label="Gespeicherte Backups">
@@ -115,10 +116,15 @@
             <button id="refreshCorruptDatabasesButton" class="secondary small" type="button">Aktualisieren</button>
           </div>
           <div class="toolbar recovery-toolbar">
+            <input id="corruptDatabaseFilter" type="search" placeholder="Defekte DBs filtern">
             <select id="corruptDatabaseSelect" aria-label="Defekte Recorder-Datenbank"></select>
             <button id="loadCorruptDatabaseButton" type="button">Zur Rettung laden</button>
           </div>
-          <span id="corruptDatabaseInfo" class="muted-line"></span>
+          <div class="pager compact-pager" aria-label="Defekte-DB-Paging">
+            <button id="prevCorruptPageButton" class="secondary small" type="button">Zurueck</button>
+            <span id="corruptDatabaseInfo">0-0 von 0</span>
+            <button id="nextCorruptPageButton" class="secondary small" type="button">Weiter</button>
+          </div>
         </section>
 
         <section class="status-grid" aria-label="Backup Datenbank">
@@ -132,6 +138,13 @@
             <strong id="backupEntityCount">0</strong>
             <span id="backupEntityDetails"></span>
           </article>
+        </section>
+
+        <section class="panel compact-panel source-details-panel" aria-label="Geladene Quelle">
+          <div class="panel-header">
+            <h2>Geladene Quelle</h2>
+          </div>
+          <div id="sourceMetaDetails" class="details-grid muted-line"></div>
         </section>
 
         <section class="management-grid single-management" aria-label="Import-Reports">
@@ -187,6 +200,7 @@
 
           <aside class="panel import-panel">
             <h2>Import</h2>
+            <div id="importReadiness" class="readiness muted-line" aria-live="polite"></div>
             <label>
               Quelle
               <input id="sourceEntity" type="text" autocomplete="off" spellcheck="false">

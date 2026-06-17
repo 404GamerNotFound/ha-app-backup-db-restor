@@ -3068,7 +3068,7 @@ def paginated_source_entities(query: dict[str, list[str]]) -> dict[str, Any]:
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "BackupDbRestore/0.5.6"
+    server_version = "BackupDbRestore/0.5.7"
 
     def do_GET(self) -> None:
         try:
@@ -3272,8 +3272,9 @@ class RequestHandler(BaseHTTPRequestHandler):
 def main() -> None:
     ensure_dirs()
     load_persisted_jobs()
-    server = ThreadingHTTPServer(("0.0.0.0", 8099), RequestHandler)
-    print("Backup DB Restore UI listening on :8099", flush=True)
+    port = int(os.environ.get("BACKUP_DB_RESTORE_PORT", "8099"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), RequestHandler)
+    print(f"Backup DB Restore UI listening on :{port}", flush=True)
     server.serve_forever()
 
 

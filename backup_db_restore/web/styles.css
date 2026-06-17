@@ -236,6 +236,10 @@ h3 {
   min-width: min(100%, 520px);
 }
 
+.recovery-toolbar input {
+  flex: 0 1 240px;
+}
+
 .progress-panel {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -493,6 +497,44 @@ input[type="text"] {
   color: var(--muted);
 }
 
+.details-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 16px;
+}
+
+.details-grid div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.details-grid strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.details-grid span {
+  overflow-wrap: anywhere;
+}
+
+.readiness {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  padding: 8px 10px;
+}
+
+.readiness-good {
+  border-color: color-mix(in srgb, var(--good) 45%, var(--line));
+  color: var(--good);
+}
+
+.readiness-warn {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+  color: var(--warn);
+}
+
 .panel-header input {
   max-width: 280px;
 }
@@ -511,6 +553,10 @@ input[type="text"] {
   gap: 10px;
   margin-top: 12px;
   color: var(--muted);
+}
+
+.compact-pager {
+  margin-top: 0;
 }
 
 .pager label {
@@ -652,6 +698,7 @@ pre {
   .status-grid,
   .diagnostics-grid,
   .management-grid,
+  .details-grid,
   .split-layout {
     grid-template-columns: 1fr;
   }

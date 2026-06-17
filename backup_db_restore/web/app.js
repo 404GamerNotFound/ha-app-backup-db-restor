@@ -18,6 +18,12 @@ const state = {
     total: 0,
     filter: "",
   },
+  corruptPage: {
+    offset: 0,
+    limit: 100,
+    total: 0,
+    filter: "",
+  },
   activeTab: "analysis",
   status: null,
   resumedJobId: null,
@@ -72,6 +78,15 @@ function setProgress(percent, status, indeterminate = false) {
 function finishProgress(status) {
   setProgress(100, status);
   window.setTimeout(() => setProgress(0, "Bereit"), 1200);
+}
+
+function sourceKindLabel(kind) {
+  const labels = {
+    upload: "Upload",
+    device_backup: "Backup",
+    corrupt_database: "Defekte DB",
+  };
+  return labels[kind] || "Quelle";
 }
 
 function setActiveTab(tabName, updateHash = true) {
@@ -383,6 +398,73 @@ function toApiDateTime(value) {
   return date.toISOString();
 }
 
+function renderUploadFileInfo() {
+  const file = $("fileInput").files[0];
+  $("uploadFileInfo").textContent = file
+    ? `${file.name} (${formatBytes(file.size)})`
+    : "Keine Datei ausgewaehlt";
+}
+
+function detailItem(label, value) {
+  if (value === null || value === undefined || value === "") return "";
+  return `
+    <div>
+      <strong>${escapeHtml(label)}</strong>
+      <span>${escapeHtml(value)}</span>
+    </div>
+  `;
+}
+
+function renderSourceMetaDetails(status) {
+  const container = $("sourceMetaDetails");
+  const meta = status?.cache?.meta;
+  const analysis = status?.cache?.analysis;
+  if (!meta || !analysis?.exists) {
+    container.innerHTML = '<div><strong>Keine Quelle geladen</strong><span>Upload, Backup oder defekte DB als Quelle laden.</span></div>';
+    return;
+  }
+
+  const sidecars = meta.recovery_sidecars || {};
+  const warnings = meta.recovery_warnings || [];
+  const sidecarSummary = Object.keys(sidecars).length
+    ? Object.entries(sidecars).map(([kind, info]) => `${kind}: ${formatBytes(info.size_bytes || 0)}`).join(", ")
+    : "";
+  const extract = meta.extract || {};
+  container.innerHTML = [
+    detailItem("Typ", sourceKindLabel(meta.source_kind)),
+    detailItem("Name", meta.original_name),
+    detailItem("Pfad", meta.original_path),
+    detailItem("Archiv-Mitglied", extract.selected_member),
+    detailItem("Sidecars", sidecarSummary),
+    detailItem("Warnungen", warnings.join(" | ")),
+    detailItem("Gecacht", formatDate(meta.cached_at)),
+  ].join("") || '<div><strong>Quelle geladen</strong><span>Keine weiteren Details vorhanden.</span></div>';
+}
+
+function renderImportReadiness() {
+  const source = $("sourceEntity").value.trim();
+  const target = $("targetEntity").value.trim();
+  const hasSourceDb = Boolean(state.status?.cache?.analysis?.exists);
+  const hasSourceEntity = source && state.sourceEntities.some((entity) => entity.entity_id === source);
+  const targetKnown = target && state.currentEntities.some((entity) => entity.entity_id === target);
+  const problems = [];
+  if (!hasSourceDb) problems.push("keine Quelle geladen");
+  if (!source) problems.push("Quelle fehlt");
+  if (source && !hasSourceEntity) problems.push("Quelle nicht in der geladenen DB-Liste");
+  if (!target) problems.push("Ziel fehlt");
+  if (target && !targetKnown) problems.push("Ziel ist aktuell nicht bekannt");
+  if (!$("dryRun").checked && !$("confirmImport").checked) problems.push("Schreibimport nicht bestaetigt");
+
+  const element = $("importReadiness");
+  if (!problems.length) {
+    element.textContent = "Bereit fuer Vorabpruefung oder Import.";
+    element.className = "readiness readiness-good";
+    return;
+  }
+  element.textContent = `Noch offen: ${problems.join(", ")}`;
+  element.className = target && !targetKnown ? "readiness readiness-warn" : "readiness";
+}
+
 function renderStatus() {
   const status = state.status;
   if (!status) return;
@@ -390,12 +472,7 @@ function renderStatus() {
   $("currentDbPath").textContent = status.options.database_path;
 
   const source = status.cache.analysis;
-  const sourceKindLabels = {
-    upload: "Upload",
-    device_backup: "Backup",
-    corrupt_database: "Defekte DB",
-  };
-  const sourceKind = sourceKindLabels[status.cache.meta?.source_kind] || "Quelle";
+  const sourceKind = sourceKindLabel(status.cache.meta?.source_kind);
   if (source && source.exists) {
     if (source.partial || (!source.ok && source.readable)) {
       $("sourceHealth").textContent = "Teilweise lesbar";
@@ -451,6 +528,8 @@ function renderStatus() {
   const allOk = targetOk && sourceOk;
   badge.textContent = allOk ? (sourceLoaded ? "Bereit" : "Aktuelle DB ok") : "Pruefen";
   badge.className = allOk ? "badge badge-good" : "badge badge-muted";
+  renderSourceMetaDetails(status);
+  renderImportReadiness();
 }
 
 function renderSourceEntities() {
@@ -475,6 +554,7 @@ function renderSourceEntities() {
       if (state.currentEntities.some((entity) => entity.entity_id === button.dataset.source)) {
         $("targetEntity").value = button.dataset.source;
       }
+      renderImportReadiness();
       renderMappingSuggestions().catch((error) => appendLog(`Mapping-Vorschlaege: ${error.message}`));
       $("targetEntity").focus();
     });
@@ -526,10 +606,14 @@ function renderCorruptDatabases() {
       return `<option value="${escapeHtml(file.id)}">${escapeHtml(label)}</option>`;
     })
     .join("");
-  const total = Number(state.corruptDatabaseTotal || 0);
-  $("corruptDatabaseInfo").textContent = total
-    ? `${total} defekte Recorder-DB(s) gefunden`
+  const page = state.corruptPage;
+  const from = page.total ? page.offset + 1 : 0;
+  const to = Math.min(page.offset + page.limit, page.total);
+  $("corruptDatabaseInfo").textContent = page.total
+    ? `${from}-${to} von ${page.total} defekte DB(s)`
     : "Keine *.corrupt Recorder-DB im aktuellen DB-Verzeichnis gefunden";
+  $("prevCorruptPageButton").disabled = page.offset <= 0;
+  $("nextCorruptPageButton").disabled = page.offset + page.limit >= page.total;
   $("loadCorruptDatabaseButton").disabled = !state.corruptDatabases.length;
 }
 
@@ -564,12 +648,20 @@ async function renderMappingSuggestions() {
   if (!source) return;
   const payload = await api(`api/mapping/suggestions?source_entity_id=${encodeURIComponent(source)}&limit=6`);
   const suggestions = payload.suggestions || [];
+  if (!suggestions.length) {
+    container.innerHTML = '<span class="muted-line">Keine Zielvorschlaege gefunden.</span>';
+    return;
+  }
   container.innerHTML = suggestions
-    .map((entity) => `<button class="secondary small" type="button" data-target="${escapeHtml(entity.entity_id)}">${escapeHtml(entity.entity_id)}</button>`)
+    .map((entity) => {
+      const reasons = entity.reasons?.length ? ` title="${escapeHtml(entity.reasons.join(", "))}"` : "";
+      return `<button class="secondary small" type="button" data-target="${escapeHtml(entity.entity_id)}"${reasons}>${escapeHtml(entity.entity_id)}</button>`;
+    })
     .join("");
   for (const button of container.querySelectorAll("button[data-target]")) {
     button.addEventListener("click", () => {
       $("targetEntity").value = button.dataset.target;
+      renderImportReadiness();
     });
   }
 }
@@ -589,6 +681,7 @@ async function fetchSourceEntities() {
     filter: source.filter || "",
   };
   renderSourceEntities();
+  renderImportReadiness();
 }
 
 async function refreshBackups() {
@@ -617,10 +710,21 @@ async function refreshBackups() {
 
 async function refreshCorruptDatabases() {
   try {
+    const params = new URLSearchParams({
+      offset: String(state.corruptPage.offset),
+      limit: String(state.corruptPage.limit),
+      filter: state.corruptPage.filter,
+    });
     appendLog("Defekte Recorder-DBs werden gesucht.");
-    const payload = await api("api/corrupt-databases?limit=100");
+    const payload = await api(`api/corrupt-databases?${params.toString()}`);
     state.corruptDatabases = payload.files || [];
     state.corruptDatabaseTotal = payload.total || 0;
+    state.corruptPage = {
+      offset: payload.offset || 0,
+      limit: payload.limit || state.corruptPage.limit,
+      total: payload.total || 0,
+      filter: payload.filter || "",
+    };
     renderCorruptDatabases();
     appendLog(`${state.corruptDatabaseTotal} defekte Recorder-DB(s) gefunden.`);
   } catch (error) {
@@ -951,6 +1055,7 @@ function bindEvents() {
   $("analysisTabButton").addEventListener("click", () => setActiveTab("analysis"));
   $("importTabButton").addEventListener("click", () => setActiveTab("import"));
   $("cancelJobButton").addEventListener("click", cancelActiveJob);
+  $("fileInput").addEventListener("change", renderUploadFileInfo);
   $("uploadButton").addEventListener("click", uploadSelectedFile);
   $("cacheButton").addEventListener("click", refreshCache);
   $("clearCacheButton").addEventListener("click", clearCache);
@@ -981,7 +1086,16 @@ function bindEvents() {
       refreshBackups().catch((error) => toast(error.message, "error"));
     }, 250);
   });
+  $("corruptDatabaseFilter").addEventListener("input", () => {
+    window.clearTimeout(bindEvents.corruptFilterTimer);
+    bindEvents.corruptFilterTimer = window.setTimeout(() => {
+      state.corruptPage.filter = $("corruptDatabaseFilter").value.trim();
+      state.corruptPage.offset = 0;
+      refreshCorruptDatabases().catch((error) => toast(error.message, "error"));
+    }, 250);
+  });
   $("sourceEntity").addEventListener("input", () => {
+    renderImportReadiness();
     window.clearTimeout(bindEvents.suggestionTimer);
     bindEvents.suggestionTimer = window.setTimeout(() => {
       renderMappingSuggestions().catch(() => {
@@ -989,6 +1103,10 @@ function bindEvents() {
       });
     }, 350);
   });
+  for (const id of ["targetEntity", "dryRun", "confirmImport", "includeStatistics"]) {
+    $(id).addEventListener("input", renderImportReadiness);
+    $(id).addEventListener("change", renderImportReadiness);
+  }
   $("prevPageButton").addEventListener("click", () => {
     state.sourcePage.offset = Math.max(0, state.sourcePage.offset - state.sourcePage.limit);
     fetchSourceEntities().catch((error) => toast(error.message, "error"));
@@ -1005,6 +1123,14 @@ function bindEvents() {
     state.backupPage.offset += state.backupPage.limit;
     refreshBackups().catch((error) => toast(error.message, "error"));
   });
+  $("prevCorruptPageButton").addEventListener("click", () => {
+    state.corruptPage.offset = Math.max(0, state.corruptPage.offset - state.corruptPage.limit);
+    refreshCorruptDatabases().catch((error) => toast(error.message, "error"));
+  });
+  $("nextCorruptPageButton").addEventListener("click", () => {
+    state.corruptPage.offset += state.corruptPage.limit;
+    refreshCorruptDatabases().catch((error) => toast(error.message, "error"));
+  });
   $("pageSizeSelect").addEventListener("change", () => {
     state.sourcePage.limit = Number($("pageSizeSelect").value);
     state.sourcePage.offset = 0;
@@ -1015,6 +1141,8 @@ function bindEvents() {
 }
 
 async function initialize() {
+  renderUploadFileInfo();
+  renderImportReadiness();
   refreshBackups().catch((error) => toast(error.message, "error"));
   refreshCorruptDatabases().catch((error) => toast(error.message, "error"));
   try {
