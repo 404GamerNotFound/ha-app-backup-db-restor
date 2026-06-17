@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import copy
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,6 +42,8 @@ STATISTICS_TABLES = ("statistics_short_term", "statistics")
 BACKUP_FILE_EXTENSIONS = (".backup", ".tar", ".tar.gz", ".tgz", ".db", ".sqlite", ".sqlite3")
 JOB_LOG_LIMIT = 300
 JOB_RETENTION_SECONDS = 6 * 60 * 60
+ANALYSIS_CACHE_TTL_SECONDS = 5 * 60
+AUTOMATIC_DEEP_ANALYSIS_MAX_BYTES = 2 * 1024 * 1024 * 1024
 ACTIVE_JOB_STATUSES = {"queued", "running", "cancelling"}
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled"}
 SOURCE_CACHE_JOB_KINDS = {"upload", "load_backup", "load_corrupt_database", "refresh_cache"}
@@ -55,6 +58,8 @@ DEFAULT_OPTIONS = {
 ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
 JOB_LOCK = threading.Lock()
 JOBS: dict[str, dict[str, Any]] = {}
+ANALYSIS_CACHE_LOCK = threading.Lock()
+ANALYSIS_CACHE: dict[str, dict[str, Any]] = {}
 
 
 class AppError(Exception):
@@ -90,6 +95,18 @@ def app_error_payload(err: AppError) -> dict[str, Any]:
     payload = {"error": err.message}
     payload.update(err.details)
     return payload
+
+
+def compact_job_result(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    compact = dict(value)
+    entities = compact.get("entities")
+    if isinstance(entities, list):
+        compact["entities_count"] = len(entities)
+        compact["entities_omitted"] = True
+        compact.pop("entities", None)
+    return compact
 
 
 def persisted_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -159,7 +176,7 @@ def load_persisted_jobs() -> None:
             "finished_at": raw_job.get("finished_at"),
             "cancel_requested": bool(raw_job.get("cancel_requested", False)),
             "logs": list(raw_job.get("logs") or [])[-JOB_LOG_LIMIT:],
-            "result": raw_job.get("result"),
+            "result": compact_job_result(raw_job.get("result")),
             "error": raw_job.get("error"),
         }
         if job["status"] in ACTIVE_JOB_STATUSES:
@@ -327,7 +344,7 @@ def run_job(job_id: str, worker: Any, args: tuple[Any, ...]) -> None:
             job = JOBS[job_id]
             job["status"] = "succeeded"
             job["progress"] = 100
-            job["result"] = result
+            job["result"] = compact_job_result(result)
             job["updated_at"] = now_iso()
             job["finished_at"] = now_iso()
             job["finished_monotonic"] = time.time()
@@ -495,6 +512,165 @@ def database_sidecar_files(path: Path) -> dict[str, dict[str, Any]]:
         "shm": file_info(Path(f"{path}-shm")),
         "journal": file_info(Path(f"{path}-journal")),
     }
+
+
+def analysis_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_size, stat.st_mtime_ns)
+
+
+def remember_analysis(path: Path, analysis: dict[str, Any]) -> None:
+    signature = analysis_signature(path)
+    if signature is None:
+        return
+    cached = copy.deepcopy(analysis)
+    cached["path"] = str(path)
+    cached["exists"] = path.exists()
+    cached["size_bytes"] = signature[0]
+    cached["sidecars"] = database_sidecar_files(path)
+    with ANALYSIS_CACHE_LOCK:
+        ANALYSIS_CACHE[str(path)] = {
+            "signature": signature,
+            "cached_monotonic": time.time(),
+            "analysis": cached,
+        }
+
+
+def cached_analyze_database(path: Path, ttl_seconds: int = ANALYSIS_CACHE_TTL_SECONDS) -> dict[str, Any]:
+    signature = analysis_signature(path)
+    cache_key = str(path)
+    now = time.time()
+    if signature is not None:
+        with ANALYSIS_CACHE_LOCK:
+            cached = ANALYSIS_CACHE.get(cache_key)
+            if (
+                cached
+                and cached.get("signature") == signature
+                and now - float(cached.get("cached_monotonic", 0)) <= ttl_seconds
+            ):
+                return copy.deepcopy(cached["analysis"])
+
+    analysis = analyze_database(path)
+    remember_analysis(path, analysis)
+    return copy.deepcopy(analysis)
+
+
+def lightweight_database_status(path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "size_bytes": path.stat().st_size if path.exists() else 0,
+        "sqlite_header": False,
+        "readable": False,
+        "partial": False,
+        "ok": False,
+        "integrity": [],
+        "foreign_key_errors": [],
+        "tables": [],
+        "states_count": 0,
+        "entities_count": 0,
+        "statistics_count": 0,
+        "statistics_short_term_count": 0,
+        "statistics_entities_count": 0,
+        "first_statistic": None,
+        "last_statistic": None,
+        "first_state": None,
+        "last_state": None,
+        "quick_check": [],
+        "journal_mode": None,
+        "page_count": None,
+        "freelist_count": None,
+        "schema_version": None,
+        "user_version": None,
+        "sidecars": database_sidecar_files(path),
+        "read_errors": [],
+        "error": None,
+    }
+    if not path.exists():
+        result["error"] = "Database file does not exist."
+    elif not is_sqlite_file(path):
+        result["error"] = "File is not a SQLite database."
+    else:
+        result["sqlite_header"] = True
+        try:
+            with open_db(path, readonly=True, timeout=2) as conn:
+                result["readable"] = True
+                for pragma in ("journal_mode", "page_count", "freelist_count", "schema_version", "user_version"):
+                    try:
+                        result[pragma] = read_pragma(conn, pragma)
+                    except sqlite3.DatabaseError as err:
+                        result["read_errors"].append(read_error(pragma, err))
+                        result["partial"] = True
+                try:
+                    tables = sorted(table_names(conn))
+                    result["tables"] = tables
+                    entity_selects: list[str] = []
+                    if "states_meta" in tables and "entity_id" in column_names(conn, "states_meta"):
+                        entity_selects.append("SELECT entity_id FROM states_meta WHERE entity_id IS NOT NULL")
+                    if "statistics_meta" in tables and "statistic_id" in column_names(conn, "statistics_meta"):
+                        entity_selects.append(
+                            "SELECT statistic_id AS entity_id FROM statistics_meta WHERE statistic_id IS NOT NULL AND instr(statistic_id, '.') > 0"
+                        )
+                    if entity_selects:
+                        union_sql = " UNION ".join(entity_selects)
+                        result["entities_count"] = int(conn.execute(f"SELECT COUNT(*) FROM ({union_sql}) entity_ids").fetchone()[0])
+                        result["statistics_entities_count"] = result["entities_count"]
+                except sqlite3.DatabaseError as err:
+                    result["read_errors"].append(read_error("table_summary", err))
+                    result["partial"] = True
+        except sqlite3.DatabaseError as err:
+            result["error"] = str(err)
+            result["partial"] = True
+    result["diagnostics"] = build_database_diagnostics(result)
+    return result
+
+
+def analyze_database_for_cache(path: Path) -> dict[str, Any]:
+    try:
+        size_bytes = path.stat().st_size
+    except OSError:
+        size_bytes = 0
+    if size_bytes <= AUTOMATIC_DEEP_ANALYSIS_MAX_BYTES:
+        analysis = analyze_database(path)
+        analysis["analysis_mode"] = "full"
+        return analysis
+
+    analysis = lightweight_database_status(path)
+    analysis["analysis_mode"] = "quick_large_database"
+    if analysis.get("readable"):
+        analysis["ok"] = True
+        analysis["error"] = None
+        diagnostics = build_database_diagnostics(analysis)
+        diagnostics.setdefault("recommendations", []).insert(
+            0,
+            {
+                "title": "Schnellanalyse fuer grosse DB",
+                "detail": "Automatische Vollpruefungen wurden uebersprungen, damit Home Assistant und andere Add-ons nicht durch 33-GB-Scans blockieren.",
+            },
+        )
+        analysis["diagnostics"] = diagnostics
+    return analysis
+
+
+def source_cache_analysis(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not SOURCE_DB.exists():
+        return None
+    if isinstance(meta, dict) and isinstance(meta.get("analysis"), dict):
+        analysis = copy.deepcopy(meta["analysis"])
+        analysis["path"] = str(SOURCE_DB)
+        analysis["exists"] = True
+        try:
+            analysis["size_bytes"] = SOURCE_DB.stat().st_size
+        except OSError:
+            pass
+        analysis["sidecars"] = database_sidecar_files(SOURCE_DB)
+        analysis["diagnostics"] = build_database_diagnostics(analysis)
+        remember_analysis(SOURCE_DB, analysis)
+        return analysis
+    return lightweight_database_status(SOURCE_DB)
 
 
 def read_pragma(conn: sqlite3.Connection, pragma: str) -> Any:
@@ -1321,16 +1497,16 @@ def list_current_entities() -> dict[str, Any]:
             api_error = str(err)
 
     db_path = Path(str(options["database_path"]))
-    if db_path.exists() and is_sqlite_file(db_path):
-        for entity in list_entities(db_path, limit=None):
+    if not entities and db_path.exists() and is_sqlite_file(db_path):
+        recorder_page = paginated_database_entities(db_path, offset=0, limit=5000)
+        for entity in recorder_page.get("entities", []):
             entity_id = entity["entity_id"]
-            if entity_id not in entities:
-                entities[entity_id] = {
-                    "entity_id": entity_id,
-                    "name": entity_id,
-                    "state": None,
-                    "source": "recorder",
-                }
+            entities[entity_id] = {
+                "entity_id": entity_id,
+                "name": entity_id,
+                "state": None,
+                "source": "recorder",
+            }
             entities[entity_id]["states_count"] = entity["states_count"]
             entities[entity_id]["first_seen"] = entity["first_seen"]
             entities[entity_id]["last_seen"] = entity["last_seen"]
@@ -1623,6 +1799,212 @@ def paginate_entities(entities: list[dict[str, Any]], offset: int, limit: int, f
     }
 
 
+def empty_entity_summary(entity_id: str) -> dict[str, Any]:
+    return {
+        "entity_id": entity_id,
+        "states_count": 0,
+        "statistics_count": 0,
+        "statistics_short_term_count": 0,
+        "first_seen": None,
+        "last_seen": None,
+        "first_statistic": None,
+        "last_statistic": None,
+    }
+
+
+def paginated_database_entities(path: Path, offset: int = 0, limit: int = 100, filter_text: str = "") -> dict[str, Any]:
+    bounded_limit = max(10, min(limit, 500))
+    bounded_offset = max(0, offset)
+    normalized_filter = filter_text.strip().lower()
+    if not path.exists() or not is_sqlite_file(path):
+        return {
+            "entities": [],
+            "offset": 0,
+            "limit": bounded_limit,
+            "total": 0,
+            "has_next": False,
+            "has_previous": False,
+            "filter": filter_text,
+        }
+
+    try:
+        with open_db(path, readonly=True) as conn:
+            tables = table_names(conn)
+            selects: list[str] = []
+            params: list[Any] = []
+
+            if "states_meta" in tables:
+                state_meta_columns = column_names(conn, "states_meta")
+                if "entity_id" in state_meta_columns:
+                    sql = "SELECT entity_id FROM states_meta WHERE entity_id IS NOT NULL"
+                    if normalized_filter:
+                        sql = f"{sql} AND lower(entity_id) LIKE ?"
+                        params.append(f"%{normalized_filter}%")
+                    selects.append(sql)
+
+            if "statistics_meta" in tables:
+                statistics_meta_columns = column_names(conn, "statistics_meta")
+                if "statistic_id" in statistics_meta_columns:
+                    sql = "SELECT statistic_id AS entity_id FROM statistics_meta WHERE statistic_id IS NOT NULL AND instr(statistic_id, '.') > 0"
+                    if normalized_filter:
+                        sql = f"{sql} AND lower(statistic_id) LIKE ?"
+                        params.append(f"%{normalized_filter}%")
+                    selects.append(sql)
+
+            if not selects and "states" in tables:
+                state_columns = column_names(conn, "states")
+                if "entity_id" in state_columns:
+                    sql = "SELECT DISTINCT entity_id FROM states WHERE entity_id IS NOT NULL"
+                    if normalized_filter:
+                        sql = f"{sql} AND lower(entity_id) LIKE ?"
+                        params.append(f"%{normalized_filter}%")
+                    selects.append(sql)
+
+            if not selects:
+                return {
+                    "entities": [],
+                    "offset": 0,
+                    "limit": bounded_limit,
+                    "total": 0,
+                    "has_next": False,
+                    "has_previous": False,
+                    "filter": filter_text,
+                }
+
+            union_sql = " UNION ".join(selects)
+            total = int(conn.execute(f"SELECT COUNT(*) FROM ({union_sql}) entity_ids", params).fetchone()[0])
+            bounded_offset = min(bounded_offset, total if total else 0)
+            entity_rows = conn.execute(
+                f"SELECT entity_id FROM ({union_sql}) entity_ids ORDER BY entity_id LIMIT ? OFFSET ?",
+                [*params, bounded_limit, bounded_offset],
+            ).fetchall()
+            entity_ids = [str(row["entity_id"]) for row in entity_rows if row["entity_id"]]
+            entities = {entity_id: empty_entity_summary(entity_id) for entity_id in entity_ids}
+
+            if entity_ids and "states" in tables:
+                state_columns = column_names(conn, "states")
+                state_meta_names_for_counts = column_names(conn, "states_meta") if "states_meta" in tables else []
+                time_column = state_time_column_name(state_columns)
+                first_expr = f"MIN({quote_identifier(time_column)})" if time_column else "NULL"
+                last_expr = f"MAX({quote_identifier(time_column)})" if time_column else "NULL"
+
+                if "states_meta" in tables and "metadata_id" in state_columns and "metadata_id" in state_meta_names_for_counts:
+                    placeholders = ", ".join("?" for _ in entity_ids)
+                    metadata_rows = conn.execute(
+                        f"SELECT metadata_id, entity_id FROM states_meta WHERE entity_id IN ({placeholders})",
+                        entity_ids,
+                    ).fetchall()
+                    for metadata in metadata_rows:
+                        entity_id = str(metadata["entity_id"])
+                        if entity_id not in entities:
+                            continue
+                        row = conn.execute(
+                            f"SELECT COUNT(*) AS row_count, {first_expr} AS first_seen, {last_expr} AS last_seen FROM states WHERE metadata_id = ?",
+                            (metadata["metadata_id"],),
+                        ).fetchone()
+                        entities[entity_id]["states_count"] = int(row["row_count"] or 0)
+                        entities[entity_id]["first_seen"] = format_db_time(row["first_seen"])
+                        entities[entity_id]["last_seen"] = format_db_time(row["last_seen"])
+                elif "entity_id" in state_columns:
+                    for entity_id in entity_ids:
+                        row = conn.execute(
+                            f"SELECT COUNT(*) AS row_count, {first_expr} AS first_seen, {last_expr} AS last_seen FROM states WHERE entity_id = ?",
+                            (entity_id,),
+                        ).fetchone()
+                        entities[entity_id]["states_count"] = int(row["row_count"] or 0)
+                        entities[entity_id]["first_seen"] = format_db_time(row["first_seen"])
+                        entities[entity_id]["last_seen"] = format_db_time(row["last_seen"])
+
+            if entity_ids and "statistics_meta" in tables:
+                statistics_meta_columns = table_columns(conn, "statistics_meta")
+                statistics_meta_names = [str(column["name"]) for column in statistics_meta_columns]
+                statistics_meta_pk = statistics_meta_primary_key(statistics_meta_columns)
+                if statistics_meta_pk and "statistic_id" in statistics_meta_names:
+                    placeholders = ", ".join("?" for _ in entity_ids)
+                    metadata_rows = conn.execute(
+                        f"""
+                        SELECT {quote_identifier(statistics_meta_pk)} AS metadata_id, statistic_id
+                        FROM statistics_meta
+                        WHERE statistic_id IN ({placeholders})
+                        """,
+                        entity_ids,
+                    ).fetchall()
+                    for metadata in metadata_rows:
+                        entity_id = str(metadata["statistic_id"])
+                        if entity_id not in entities:
+                            continue
+                        for table in STATISTICS_TABLES:
+                            if table not in tables:
+                                continue
+                            columns = column_names(conn, table)
+                            if "metadata_id" not in columns:
+                                continue
+                            start_column = start_time_column(columns)
+                            first_expr = f"MIN({quote_identifier(start_column)})" if start_column else "NULL"
+                            last_expr = f"MAX({quote_identifier(start_column)})" if start_column else "NULL"
+                            row = conn.execute(
+                                f"""
+                                SELECT COUNT(*) AS row_count, {first_expr} AS first_seen, {last_expr} AS last_seen
+                                FROM {quote_identifier(table)}
+                                WHERE metadata_id = ?
+                                """,
+                                (metadata["metadata_id"],),
+                            ).fetchone()
+                            count_key = "statistics_short_term_count" if table == "statistics_short_term" else "statistics_count"
+                            entities[entity_id][count_key] = int(row["row_count"] or 0)
+                            first_seen = format_db_time(row["first_seen"])
+                            last_seen = format_db_time(row["last_seen"])
+                            if first_seen and (entities[entity_id]["first_statistic"] is None or str(first_seen) < str(entities[entity_id]["first_statistic"])):
+                                entities[entity_id]["first_statistic"] = first_seen
+                            if last_seen and (entities[entity_id]["last_statistic"] is None or str(last_seen) > str(entities[entity_id]["last_statistic"])):
+                                entities[entity_id]["last_statistic"] = last_seen
+
+            return {
+                "entities": [entities[entity_id] for entity_id in entity_ids],
+                "offset": bounded_offset,
+                "limit": bounded_limit,
+                "total": total,
+                "has_next": bounded_offset + bounded_limit < total,
+                "has_previous": bounded_offset > 0,
+                "filter": filter_text,
+            }
+    except sqlite3.DatabaseError as err:
+        return {
+            "entities": [],
+            "offset": 0,
+            "limit": bounded_limit,
+            "total": 0,
+            "has_next": False,
+            "has_previous": False,
+            "filter": filter_text,
+            "error": str(err),
+        }
+
+
+def database_entity_exists(path: Path, entity_id: str) -> bool:
+    if not entity_id or not path.exists() or not is_sqlite_file(path):
+        return False
+    try:
+        with open_db(path, readonly=True) as conn:
+            tables = table_names(conn)
+            if "states_meta" in tables and "entity_id" in column_names(conn, "states_meta"):
+                row = conn.execute("SELECT 1 FROM states_meta WHERE entity_id = ? LIMIT 1", (entity_id,)).fetchone()
+                if row is not None:
+                    return True
+            if "statistics_meta" in tables and "statistic_id" in column_names(conn, "statistics_meta"):
+                row = conn.execute("SELECT 1 FROM statistics_meta WHERE statistic_id = ? LIMIT 1", (entity_id,)).fetchone()
+                if row is not None:
+                    return True
+            if "states" in tables:
+                state_columns = column_names(conn, "states")
+                if "entity_id" in state_columns:
+                    row = conn.execute("SELECT 1 FROM states WHERE entity_id = ? LIMIT 1", (entity_id,)).fetchone()
+                    return row is not None
+    except sqlite3.DatabaseError:
+        return False
+    return False
+
+
 def candidate_score(member_name: str) -> int:
     normalized = member_name.replace("\\", "/").lower()
     basename = normalized.rsplit("/", 1)[-1]
@@ -1718,19 +2100,20 @@ def cache_source_file(
     staged_original = TMP_DIR / f"source_original_{int(time.time())}_{uuid.uuid4().hex}"
     try:
         extract_info = extract_database(source_path, working_db, original_name, cancel_callback)
-        analysis = analyze_database(working_db)
+        analysis = analyze_database_for_cache(working_db)
         if not analysis["sqlite_header"]:
             raise AppError("The extracted file is not a SQLite database.")
 
-        entities = list_entities(working_db, limit=None)
+        analysis_for_cache = copy.deepcopy(analysis)
+        analysis_for_cache["path"] = str(SOURCE_DB)
         meta = {
             "cached_at": now_iso(),
             "source_kind": source_kind,
             "original_name": original_name,
             "original_path": original_path,
             "extract": extract_info,
-            "analysis": analysis,
-            "entities_count": len(entities),
+            "analysis": analysis_for_cache,
+            "entities_count": int(analysis.get("entities_count") or 0),
         }
         if copy_original:
             copy_path(source_path, staged_original, cancel_callback)
@@ -1745,8 +2128,11 @@ def cache_source_file(
             except FileNotFoundError:
                 pass
         working_db.replace(SOURCE_DB)
+        meta["analysis"]["sidecars"] = database_sidecar_files(SOURCE_DB)
+        meta["analysis"]["diagnostics"] = build_database_diagnostics(meta["analysis"])
+        remember_analysis(SOURCE_DB, meta["analysis"])
         write_source_meta(meta)
-        return {"meta": meta, "entities": entities}
+        return {"meta": meta, "entities_count": meta["entities_count"], "entities_omitted": True}
     finally:
         try:
             working_db.unlink()
@@ -1811,21 +2197,22 @@ def cache_corrupt_database(file_id: str, cancel_callback: Any = None) -> dict[st
         copy_path(source_path, staged_db, cancel_callback)
         copied_sidecars = copy_recovery_sidecars(source_path, staged_db, cancel_callback)
 
-        analysis = analyze_database(staged_db)
+        analysis = analyze_database_for_cache(staged_db)
         warnings: list[str] = []
         used_sidecars = copied_sidecars
         if copied_sidecars and not analysis.get("readable", False):
             warnings.append("Quelle war mit WAL/SHM-Sidecars nicht lesbar. Es wurde automatisch ohne Sidecars erneut versucht.")
             remove_source_sidecars(staged_db)
             used_sidecars = {}
-            analysis = analyze_database(staged_db)
+            analysis = analyze_database_for_cache(staged_db)
 
         if not analysis["sqlite_header"]:
             raise AppError("Selected corrupt database is not a SQLite database.")
         if not analysis.get("readable", analysis.get("ok", False)):
             raise AppError(analysis.get("error") or "Selected corrupt database is not readable enough for rescue.")
 
-        entities = list_entities(staged_db, limit=None)
+        analysis_for_cache = copy.deepcopy(analysis)
+        analysis_for_cache["path"] = str(SOURCE_DB)
         meta = {
             "cached_at": now_iso(),
             "source_kind": "corrupt_database",
@@ -1833,8 +2220,8 @@ def cache_corrupt_database(file_id: str, cancel_callback: Any = None) -> dict[st
             "original_path": str(source_path),
             "recovery_sidecars": final_sidecar_info(used_sidecars),
             "recovery_warnings": warnings,
-            "analysis": analysis,
-            "entities_count": len(entities),
+            "analysis": analysis_for_cache,
+            "entities_count": int(analysis.get("entities_count") or 0),
         }
 
         check_cancel(cancel_callback)
@@ -1842,8 +2229,11 @@ def cache_corrupt_database(file_id: str, cancel_callback: Any = None) -> dict[st
         staged_db.replace(SOURCE_DB)
         for kind, info in used_sidecars.items():
             Path(str(info["destination"])).replace(Path(f"{SOURCE_DB}-{kind}"))
+        meta["analysis"]["sidecars"] = database_sidecar_files(SOURCE_DB)
+        meta["analysis"]["diagnostics"] = build_database_diagnostics(meta["analysis"])
+        remember_analysis(SOURCE_DB, meta["analysis"])
         write_source_meta(meta)
-        return {"meta": meta, "entities": entities}
+        return {"meta": meta, "entities_count": meta["entities_count"], "entities_omitted": True}
 
 
 def handle_uploaded_file(upload_path: Path, original_name: str, cancel_callback: Any = None) -> dict[str, Any]:
@@ -1864,7 +2254,7 @@ def handle_device_backup_file(file_id: str, cancel_callback: Any = None) -> dict
 
 def cache_status() -> dict[str, Any]:
     meta = read_source_meta()
-    analysis = analyze_database(SOURCE_DB) if SOURCE_DB.exists() else None
+    analysis = source_cache_analysis(meta)
     return {
         "has_cached_database": SOURCE_DB.exists(),
         "source_db": str(SOURCE_DB),
@@ -2150,8 +2540,11 @@ class HistoryImporter:
         if not ENTITY_ID_RE.match(self.target_entity):
             raise AppError("Target entity id is invalid.")
 
-        source_analysis = analyze_database(self.source_db)
-        target_analysis = analyze_database(self.target_db)
+        if self.source_db == SOURCE_DB:
+            source_analysis = source_cache_analysis(read_source_meta()) or analyze_database_for_cache(self.source_db)
+        else:
+            source_analysis = analyze_database_for_cache(self.source_db)
+        target_analysis = cached_analyze_database(self.target_db)
         if not source_analysis["sqlite_header"] or not source_analysis.get("readable", False):
             raise AppError("Source database is not readable enough for import.")
         if not source_analysis.get("ok", False):
@@ -2161,8 +2554,7 @@ class HistoryImporter:
         self.check_cancelled()
 
         with open_db(self.source_db, readonly=True) as source_conn:
-            source_entities = {item["entity_id"] for item in list_entities(self.source_db, limit=None)}
-            if self.source_entity not in source_entities:
+            if not database_entity_exists(self.source_db, self.source_entity):
                 raise AppError("Source entity was not found in the cached database.")
             self.check_cancelled()
 
@@ -2813,8 +3205,10 @@ def preflight_import(payload: dict[str, Any]) -> dict[str, Any]:
     options = read_options()
     target_db = Path(str(options["database_path"]))
 
-    source_analysis = analyze_database(SOURCE_DB) if SOURCE_DB.exists() else {"exists": False, "ok": False}
-    target_analysis = analyze_database(target_db) if target_db.exists() else {"exists": False, "ok": False}
+    source_analysis = source_cache_analysis(read_source_meta()) if SOURCE_DB.exists() else {"exists": False, "ok": False}
+    if source_analysis is None:
+        source_analysis = {"exists": False, "ok": False}
+    target_analysis = cached_analyze_database(target_db) if target_db.exists() else {"exists": False, "ok": False}
     source_readable = bool(source_analysis.get("sqlite_header")) and bool(source_analysis.get("readable", source_analysis.get("ok")))
     checks.append({"name": "source_database", "ok": source_readable, "details": source_analysis.get("error")})
     checks.append({"name": "target_database", "ok": bool(target_analysis.get("ok")), "details": target_analysis.get("error")})
@@ -2825,8 +3219,7 @@ def preflight_import(payload: dict[str, Any]) -> dict[str, Any]:
         warnings.append("Quelle und Ziel haben dieselbe Entity ID. Das ist nur sinnvoll, wenn Daten aus einer alten DB ergaenzt werden.")
 
     if SOURCE_DB.exists() and is_sqlite_file(SOURCE_DB):
-        source_entities = {entity["entity_id"] for entity in list_entities(SOURCE_DB, limit=None)}
-        checks.append({"name": "source_entity", "ok": source_entity in source_entities, "details": source_entity})
+        checks.append({"name": "source_entity", "ok": database_entity_exists(SOURCE_DB, source_entity), "details": source_entity})
     else:
         checks.append({"name": "source_entity", "ok": False, "details": "No cached source database."})
 
@@ -2953,13 +3346,13 @@ def job_refresh_cached_database(job_id: str) -> dict[str, Any]:
         raise AppError("No cached database is available.")
     update_job(job_id, progress=20, message="Cache-Datenbank wird neu analysiert.")
     raise_if_cancelled(job_id)
-    entities = list_entities(SOURCE_DB, limit=None)
-    raise_if_cancelled(job_id)
     meta = read_source_meta() or {}
-    meta.update({"cached_at": now_iso(), "analysis": analyze_database(SOURCE_DB), "entities_count": len(entities)})
+    analysis = analyze_database(SOURCE_DB)
+    remember_analysis(SOURCE_DB, analysis)
+    meta.update({"cached_at": now_iso(), "analysis": analysis, "entities_count": int(analysis.get("entities_count") or 0)})
     write_source_meta(meta)
     update_job(job_id, progress=85, message="Cache-Metadaten aktualisiert.")
-    return {"meta": meta, "entities": entities}
+    return {"meta": meta, "entities_count": meta["entities_count"], "entities_omitted": True}
 
 
 def job_import_history(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3042,7 +3435,7 @@ def app_status() -> dict[str, Any]:
             "create_current_db_backup": bool(options.get("create_current_db_backup", True)),
         },
         "cache": cache_status(),
-        "current_database": analyze_database(current_db),
+        "current_database": cached_analyze_database(current_db),
         "active_job": active_job(),
     }
 
@@ -3061,14 +3454,13 @@ def paginated_source_entities(query: dict[str, list[str]]) -> dict[str, Any]:
     offset = query_int(query, "offset", 0)
     limit = query_int(query, "limit", 100)
     filter_text = query.get("filter", [""])[0]
-    entities = list_entities(SOURCE_DB, limit=None)
-    page = paginate_entities(entities, offset, limit, filter_text)
+    page = paginated_database_entities(SOURCE_DB, offset, limit, filter_text)
     page["cache"] = cache_status()
     return page
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "BackupDbRestore/0.5.7"
+    server_version = "BackupDbRestore/0.5.8"
 
     def do_GET(self) -> None:
         try:
@@ -3174,11 +3566,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 ensure_no_conflicting_job("refresh_cache")
                 if not SOURCE_DB.exists():
                     raise AppError("No cached database is available.")
-                entities = list_entities(SOURCE_DB, limit=None)
                 meta = read_source_meta() or {}
-                meta.update({"cached_at": now_iso(), "analysis": analyze_database(SOURCE_DB), "entities_count": len(entities)})
+                analysis = analyze_database(SOURCE_DB)
+                remember_analysis(SOURCE_DB, analysis)
+                meta.update({"cached_at": now_iso(), "analysis": analysis, "entities_count": int(analysis.get("entities_count") or 0)})
                 write_source_meta(meta)
-                self.send_json({"meta": meta, "entities": entities})
+                self.send_json({"meta": meta, "entities_count": meta["entities_count"], "entities_omitted": True})
             elif path == "/api/cache/clear":
                 ensure_no_conflicting_job("refresh_cache")
                 self.send_json(clear_cache())

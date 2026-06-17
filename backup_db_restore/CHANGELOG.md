@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.8
+
+- Grosse Quell-Datenbanken werden beim automatischen Laden ab 2 GB nur noch per
+  Schnellanalyse geprueft. Teure Vollpruefungen wie Integrity-Checks,
+  globale Entity-Gruppierungen und grosse Tabellen-Scans werden dadurch nicht
+  mehr direkt nach dem Zwischenspeichern erzwungen.
+- Der Status-Endpunkt verwendet die beim Laden gespeicherten Cache-Metadaten,
+  statt `source.db` bei jedem Refresh erneut zu analysieren.
+- Job-Ergebnisse enthalten keine komplette Entity-Liste mehr. Stattdessen werden
+  nur Zaehler und Metadaten persistiert, damit `/data/jobs.json` und Ingress-
+  Antworten auch bei 33-GB-Datenbanken klein bleiben.
+- Die Quell-Entity-Liste liest nun echte Seiten aus `states_meta` und
+  `statistics_meta`, anstatt zuerst alle Entitaeten der Quell-DB zu laden.
+- Vorabpruefung und Import pruefen die ausgewaehlte Source-Entity per gezieltem
+  SQL-Existenzcheck, statt alle Entities in den Speicher zu laden.
+- Die aktuelle Home-Assistant-Entity-Liste nutzt die Core-API als primaere
+  Quelle; ein Recorder-DB-Fallback wird nur noch verwendet, wenn die API keine
+  Entities liefert.
+
 ## 0.5.7
 
 - Corrupt-DB-Auswahl im Import-Tab um Filter und Paging erweitert, damit viele
