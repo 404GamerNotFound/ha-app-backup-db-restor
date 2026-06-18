@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.12
+
+- Bereich `Top Speicherfresser` in der aktuellen DB-Entity-Ansicht optisch
+  ueberarbeitet. Lange Entity-IDs werden nun einzeilig mit Ellipsis und
+  Tooltip angezeigt, damit die Karten nicht mehr zeichenweise umbrechen.
+- Top-Speicherfresser-Karten haben jetzt einen `Purge`-Shortcut. Der Button
+  waehlt die Entity aus und laedt direkt die Purge-Vorschau; geloescht wird
+  weiterhin erst nach explizitem Klick auf `Purge ausfuehren`.
+
 ## 0.5.11
 
 - Neuer Tab `Einstellungen` ergaenzt. Allgemeine App-Optionen wie

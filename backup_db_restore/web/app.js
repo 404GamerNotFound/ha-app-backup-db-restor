@@ -759,6 +759,15 @@ function startImportFromCurrentEntity(entityId) {
   $("sourceEntity").focus();
 }
 
+async function prepareCurrentEntityPurge(entityId) {
+  state.selectedCurrentEntityIds.clear();
+  state.selectedCurrentEntityIds.add(entityId);
+  resetCurrentPurgePreview();
+  renderCurrentDbEntities();
+  document.querySelector(".purge-controls")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  await previewCurrentEntityHistoryPurge();
+}
+
 function renderCurrentTopEntities() {
   const container = $("currentTopEntities");
   if (!state.currentTopEntities.length) {
@@ -772,14 +781,25 @@ function renderCurrentTopEntities() {
       const disabled = state.isBusy ? " disabled" : "";
       return `
         <div class="top-entity-row">
-          <strong>${index + 1}</strong>
-          <code>${escapeHtml(entity.entity_id)}</code>
-          <span>${formatNumber(datapoints)} Datenpunkte</span>
-          <button class="secondary small" type="button" data-current-import="${escapeHtml(entity.entity_id)}"${disabled}>Import</button>
+          <strong class="top-entity-rank">${index + 1}</strong>
+          <div class="top-entity-main">
+            <code class="top-entity-id" title="${escapeHtml(entity.entity_id)}">${escapeHtml(entity.entity_id)}</code>
+            <span class="top-entity-count">${formatNumber(datapoints)} Datenpunkte</span>
+          </div>
+          <div class="top-entity-actions">
+            <button class="secondary small purge-shortcut" type="button" data-current-purge="${escapeHtml(entity.entity_id)}"${disabled}>Purge</button>
+            <button class="secondary small" type="button" data-current-import="${escapeHtml(entity.entity_id)}"${disabled}>Import</button>
+          </div>
         </div>
       `;
     })
     .join("");
+
+  for (const button of container.querySelectorAll("button[data-current-purge]")) {
+    button.addEventListener("click", () => {
+      prepareCurrentEntityPurge(button.dataset.currentPurge).catch((error) => toast(error.message, "error"));
+    });
+  }
 
   for (const button of container.querySelectorAll("button[data-current-import]")) {
     button.addEventListener("click", () => startImportFromCurrentEntity(button.dataset.currentImport));
@@ -835,6 +855,9 @@ function setCurrentPurgeButtonsBusy(isBusy) {
     checkbox.disabled = isBusy;
   }
   for (const button of document.querySelectorAll("button[data-current-import]")) {
+    button.disabled = isBusy;
+  }
+  for (const button of document.querySelectorAll("button[data-current-purge]")) {
     button.disabled = isBusy;
   }
   renderCurrentPurgeControls();
