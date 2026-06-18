@@ -467,20 +467,32 @@ def safe_artifact_id(value: str) -> str:
     return normalized
 
 
-def sqlite_uri(path: Path, readonly: bool = False) -> str:
+def sqlite_uri(path: Path, readonly: bool = False, immutable: bool = False) -> str:
     quoted = urllib.parse.quote(str(path), safe="/:")
+    params: list[str] = []
     if readonly:
-        return f"file:{quoted}?mode=ro"
-    return f"file:{quoted}"
+        params.append("mode=ro")
+    if immutable:
+        params.append("immutable=1")
+    query = f"?{'&'.join(params)}" if params else ""
+    return f"file:{quoted}{query}"
 
 
-def open_db(path: Path, readonly: bool = False, timeout: float = 30.0) -> sqlite3.Connection:
+def open_db(path: Path, readonly: bool = False, timeout: float = 30.0, immutable: bool = False) -> sqlite3.Connection:
     if readonly:
-        conn = sqlite3.connect(sqlite_uri(path, readonly=True), uri=True, timeout=timeout)
+        conn = sqlite3.connect(sqlite_uri(path, readonly=True, immutable=immutable), uri=True, timeout=timeout)
     else:
         conn = sqlite3.connect(str(path), timeout=timeout)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def open_db_readonly_resilient(path: Path, timeout: float = 30.0) -> tuple[sqlite3.Connection, str | None]:
+    try:
+        return open_db(path, readonly=True, timeout=timeout), None
+    except sqlite3.DatabaseError as err:
+        conn = open_db(path, readonly=True, timeout=timeout, immutable=True)
+        return conn, f"readonly_open: {err}; immutable fallback active"
 
 
 def is_sqlite_file(path: Path) -> bool:
@@ -595,35 +607,42 @@ def lightweight_database_status(path: Path) -> dict[str, Any]:
         result["error"] = "File is not a SQLite database."
     else:
         result["sqlite_header"] = True
+        conn: sqlite3.Connection | None = None
         try:
-            with open_db(path, readonly=True, timeout=2) as conn:
-                result["readable"] = True
-                for pragma in ("journal_mode", "page_count", "freelist_count", "schema_version", "user_version"):
-                    try:
-                        result[pragma] = read_pragma(conn, pragma)
-                    except sqlite3.DatabaseError as err:
-                        result["read_errors"].append(read_error(pragma, err))
-                        result["partial"] = True
+            conn, fallback_warning = open_db_readonly_resilient(path, timeout=2)
+            if fallback_warning:
+                result["read_errors"].append(fallback_warning)
+                result["partial"] = True
+            result["readable"] = True
+            for pragma in ("journal_mode", "page_count", "freelist_count", "schema_version", "user_version"):
                 try:
-                    tables = sorted(table_names(conn))
-                    result["tables"] = tables
-                    entity_selects: list[str] = []
-                    if "states_meta" in tables and "entity_id" in column_names(conn, "states_meta"):
-                        entity_selects.append("SELECT entity_id FROM states_meta WHERE entity_id IS NOT NULL")
-                    if "statistics_meta" in tables and "statistic_id" in column_names(conn, "statistics_meta"):
-                        entity_selects.append(
-                            "SELECT statistic_id AS entity_id FROM statistics_meta WHERE statistic_id IS NOT NULL AND instr(statistic_id, '.') > 0"
-                        )
-                    if entity_selects:
-                        union_sql = " UNION ".join(entity_selects)
-                        result["entities_count"] = int(conn.execute(f"SELECT COUNT(*) FROM ({union_sql}) entity_ids").fetchone()[0])
-                        result["statistics_entities_count"] = result["entities_count"]
+                    result[pragma] = read_pragma(conn, pragma)
                 except sqlite3.DatabaseError as err:
-                    result["read_errors"].append(read_error("table_summary", err))
+                    result["read_errors"].append(read_error(pragma, err))
                     result["partial"] = True
+            try:
+                tables = sorted(table_names(conn))
+                result["tables"] = tables
+                entity_selects: list[str] = []
+                if "states_meta" in tables and "entity_id" in column_names(conn, "states_meta"):
+                    entity_selects.append("SELECT entity_id FROM states_meta WHERE entity_id IS NOT NULL")
+                if "statistics_meta" in tables and "statistic_id" in column_names(conn, "statistics_meta"):
+                    entity_selects.append(
+                        "SELECT statistic_id AS entity_id FROM statistics_meta WHERE statistic_id IS NOT NULL AND instr(statistic_id, '.') > 0"
+                    )
+                if entity_selects:
+                    union_sql = " UNION ".join(entity_selects)
+                    result["entities_count"] = int(conn.execute(f"SELECT COUNT(*) FROM ({union_sql}) entity_ids").fetchone()[0])
+                    result["statistics_entities_count"] = result["entities_count"]
+            except sqlite3.DatabaseError as err:
+                result["read_errors"].append(read_error("table_summary", err))
+                result["partial"] = True
         except sqlite3.DatabaseError as err:
             result["error"] = str(err)
             result["partial"] = True
+        finally:
+            if conn is not None:
+                conn.close()
     result["diagnostics"] = build_database_diagnostics(result)
     return result
 
@@ -1547,6 +1566,24 @@ def copy_path(source: Path, destination: Path, cancel_callback: Any = None) -> N
         pass
 
 
+def link_or_copy_path(source: Path, destination: Path, cancel_callback: Any = None, prefer_link: bool = False) -> str:
+    if prefer_link:
+        try:
+            os.link(source, destination)
+            return "hardlink"
+        except OSError:
+            try:
+                destination.symlink_to(source)
+                return "symlink"
+            except OSError:
+                pass
+    try:
+        copy_path(source, destination, cancel_callback)
+        return "copy"
+    except OSError as err:
+        raise AppError(f"Datei konnte nicht in den Cache uebernommen werden: {err}") from err
+
+
 def supported_backup_file(path: Path) -> bool:
     normalized = path.name.lower()
     return normalized.endswith(BACKUP_FILE_EXTENSIONS)
@@ -1812,7 +1849,13 @@ def empty_entity_summary(entity_id: str) -> dict[str, Any]:
     }
 
 
-def paginated_database_entities(path: Path, offset: int = 0, limit: int = 100, filter_text: str = "") -> dict[str, Any]:
+def paginated_database_entities(
+    path: Path,
+    offset: int = 0,
+    limit: int = 100,
+    filter_text: str = "",
+    immutable: bool = False,
+) -> dict[str, Any]:
     bounded_limit = max(10, min(limit, 500))
     bounded_offset = max(0, offset)
     normalized_filter = filter_text.strip().lower()
@@ -1828,7 +1871,7 @@ def paginated_database_entities(path: Path, offset: int = 0, limit: int = 100, f
         }
 
     try:
-        with open_db(path, readonly=True) as conn:
+        with open_db(path, readonly=True, immutable=immutable) as conn:
             tables = table_names(conn)
             selects: list[str] = []
             params: list[Any] = []
@@ -1969,6 +2012,13 @@ def paginated_database_entities(path: Path, offset: int = 0, limit: int = 100, f
                 "filter": filter_text,
             }
     except sqlite3.DatabaseError as err:
+        if not immutable:
+            page = paginated_database_entities(path, offset, limit, filter_text, immutable=True)
+            if page.get("error"):
+                page["error"] = f"{err}; immutable fallback: {page['error']}"
+            else:
+                page["read_warning"] = f"{err}; immutable fallback active"
+            return page
         return {
             "entities": [],
             "offset": 0,
@@ -1981,11 +2031,11 @@ def paginated_database_entities(path: Path, offset: int = 0, limit: int = 100, f
         }
 
 
-def database_entity_exists(path: Path, entity_id: str) -> bool:
+def database_entity_exists(path: Path, entity_id: str, immutable: bool = False) -> bool:
     if not entity_id or not path.exists() or not is_sqlite_file(path):
         return False
     try:
-        with open_db(path, readonly=True) as conn:
+        with open_db(path, readonly=True, immutable=immutable) as conn:
             tables = table_names(conn)
             if "states_meta" in tables and "entity_id" in column_names(conn, "states_meta"):
                 row = conn.execute("SELECT 1 FROM states_meta WHERE entity_id = ? LIMIT 1", (entity_id,)).fetchone()
@@ -2001,6 +2051,8 @@ def database_entity_exists(path: Path, entity_id: str) -> bool:
                     row = conn.execute("SELECT 1 FROM states WHERE entity_id = ? LIMIT 1", (entity_id,)).fetchone()
                     return row is not None
     except sqlite3.DatabaseError:
+        if not immutable:
+            return database_entity_exists(path, entity_id, immutable=True)
         return False
     return False
 
@@ -2144,7 +2196,12 @@ def cache_source_file(
             pass
 
 
-def copy_recovery_sidecars(source_path: Path, destination_db: Path = SOURCE_DB, cancel_callback: Any = None) -> dict[str, dict[str, Any]]:
+def copy_recovery_sidecars(
+    source_path: Path,
+    destination_db: Path = SOURCE_DB,
+    cancel_callback: Any = None,
+    prefer_link: bool = False,
+) -> dict[str, dict[str, Any]]:
     copied: dict[str, dict[str, Any]] = {}
     destinations = {
         "wal": Path(f"{destination_db}-wal"),
@@ -2153,11 +2210,12 @@ def copy_recovery_sidecars(source_path: Path, destination_db: Path = SOURCE_DB, 
     }
     for kind, sidecar in matching_corrupt_sidecars(source_path).items():
         destination = destinations[kind]
-        copy_path(sidecar, destination, cancel_callback)
+        storage = link_or_copy_path(sidecar, destination, cancel_callback, prefer_link=prefer_link)
         copied[kind] = {
             "source": str(sidecar),
             "destination": str(destination),
             "size_bytes": destination.stat().st_size,
+            "storage": storage,
         }
     return copied
 
@@ -2185,6 +2243,7 @@ def final_sidecar_info(copied_sidecars: dict[str, dict[str, Any]]) -> dict[str, 
             "source": info.get("source"),
             "destination": str(final_paths[kind]),
             "size_bytes": info.get("size_bytes"),
+            "storage": info.get("storage"),
         }
         for kind, info in copied_sidecars.items()
     }
@@ -2192,10 +2251,15 @@ def final_sidecar_info(copied_sidecars: dict[str, dict[str, Any]]) -> dict[str, 
 
 def cache_corrupt_database(file_id: str, cancel_callback: Any = None) -> dict[str, Any]:
     source_path = resolve_corrupt_database(file_id)
+    try:
+        source_size = source_path.stat().st_size
+    except OSError:
+        source_size = 0
+    prefer_link = source_size >= AUTOMATIC_DEEP_ANALYSIS_MAX_BYTES
     with tempfile.TemporaryDirectory(dir=str(TMP_DIR)) as temp_dir:
         staged_db = Path(temp_dir) / "source.db"
-        copy_path(source_path, staged_db, cancel_callback)
-        copied_sidecars = copy_recovery_sidecars(source_path, staged_db, cancel_callback)
+        cache_storage = link_or_copy_path(source_path, staged_db, cancel_callback, prefer_link=prefer_link)
+        copied_sidecars = copy_recovery_sidecars(source_path, staged_db, cancel_callback, prefer_link=prefer_link)
 
         analysis = analyze_database_for_cache(staged_db)
         warnings: list[str] = []
@@ -2218,6 +2282,7 @@ def cache_corrupt_database(file_id: str, cancel_callback: Any = None) -> dict[st
             "source_kind": "corrupt_database",
             "original_name": source_path.name,
             "original_path": str(source_path),
+            "cache_storage": cache_storage,
             "recovery_sidecars": final_sidecar_info(used_sidecars),
             "recovery_warnings": warnings,
             "analysis": analysis_for_cache,
@@ -3331,6 +3396,8 @@ def job_cache_corrupt_database(job_id: str, file_id: str) -> dict[str, Any]:
     raise_if_cancelled(job_id)
     result = cache_corrupt_database(file_id, cancel_callback=lambda: raise_if_cancelled(job_id))
     meta = result.get("meta") or {}
+    if meta.get("cache_storage") in {"hardlink", "symlink"}:
+        update_job(job_id, progress=65, message=f"Grosse Recorder-DB wurde per {meta['cache_storage']} in den Cache eingebunden.")
     sidecars = meta.get("recovery_sidecars") or {}
     if sidecars:
         update_job(job_id, progress=70, message=f"{len(sidecars)} passende WAL/SHM-Sidecar-Datei(en) wurden mitgeladen.")

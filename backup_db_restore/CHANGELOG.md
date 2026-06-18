@@ -18,6 +18,11 @@
 - Die aktuelle Home-Assistant-Entity-Liste nutzt die Core-API als primaere
   Quelle; ein Recorder-DB-Fallback wird nur noch verwendet, wenn die API keine
   Entities liefert.
+- Grosse lokale Corrupt-DBs werden im Rettungs-Cache per Hardlink/Symlink
+  eingebunden, wenn moeglich. Dadurch muss eine 33-GB-Datei nicht noch einmal
+  nach `/data/tmp` kopiert werden.
+- SQLite-Lesezugriffe verwenden einen `immutable`-Fallback, wenn normales
+  Read-only-Oeffnen mit generischen Fehlern wie `Load failed` scheitert.
 
 ## 0.5.7
 
