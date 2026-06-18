@@ -11,6 +11,12 @@ importiert werden.
 ## Funktionen
 
 - Uploads bis 128 GB und direkte Auswahl gespeicherter `/backup`-Dateien.
+- Konfigurierbarer Cache-Pfad, z. B. auf einem unter `/media` oder `/share`
+  eingebundenen USB-/externen Speicher.
+- Einstellungsseite fuer allgemeine Optionen wie DB-Pfad, Cache-Pfad,
+  Konfig-Backup-Ziel, Upload-Limit, Log-Level und automatische DB-Sicherung.
+- Selektive Konfig-Backups fuer Automationen, Skripte, Szenen, Blueprints,
+  Dashboards, Helpers und optionale Secrets.
 - Rekursive Suche nach der Recorder-Datenbank in vollstaendigen HA-Backups.
 - Datenbank-Integrity-Check, Entity-Liste mit Paging und Filter.
 - Import von State-History mit Quell-/Ziel-Entity-Mapping.

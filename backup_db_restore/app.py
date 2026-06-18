@@ -15,6 +15,8 @@ import urllib.parse
 import urllib.request
 import uuid
 import copy
+import hashlib
+import io
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,20 +28,101 @@ APP_DIR = Path(os.environ.get("BACKUP_DB_RESTORE_APP_DIR", "/app"))
 WEB_DIR = Path(os.environ.get("BACKUP_DB_RESTORE_WEB_DIR", str(APP_DIR / "web")))
 DATA_DIR = Path(os.environ.get("BACKUP_DB_RESTORE_DATA_DIR", "/data"))
 BACKUP_DIR = Path(os.environ.get("BACKUP_DB_RESTORE_BACKUP_DIR", "/backup"))
-CACHE_DIR = DATA_DIR / "cache"
-UPLOAD_DIR = DATA_DIR / "uploads"
-TMP_DIR = DATA_DIR / "tmp"
+CONFIG_DIR = Path(os.environ.get("BACKUP_DB_RESTORE_CONFIG_DIR", "/homeassistant_config"))
+OPTIONS_PATH = DATA_DIR / "options.json"
+APP_VERSION = "0.5.11"
+VALID_LOG_LEVELS = {"trace", "debug", "info", "notice", "warning", "error", "fatal"}
+DEFAULT_OPTIONS = {
+    "log_level": "info",
+    "database_path": "/homeassistant_config/home-assistant_v2.db",
+    "max_upload_mb": 131072,
+    "create_current_db_backup": True,
+    "cache_path": str(DATA_DIR / "cache"),
+    "config_backup_path": str(DATA_DIR / "config-backups"),
+}
+
+
+def read_startup_options() -> dict[str, Any]:
+    options = DEFAULT_OPTIONS.copy()
+    if OPTIONS_PATH.exists():
+        try:
+            with OPTIONS_PATH.open("r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                options.update(loaded)
+        except (OSError, json.JSONDecodeError):
+            pass
+    return options
+
+
+def configured_cache_dir(options: dict[str, Any]) -> Path:
+    configured = os.environ.get("BACKUP_DB_RESTORE_CACHE_PATH") or options.get("cache_path") or DEFAULT_OPTIONS["cache_path"]
+    configured_text = str(configured).strip() or DEFAULT_OPTIONS["cache_path"]
+    cache_path = Path(configured_text).expanduser()
+    if not cache_path.is_absolute():
+        cache_path = DATA_DIR / cache_path
+    return cache_path
+
+
+def configured_config_backup_dir(options: dict[str, Any] | None = None) -> Path:
+    source_options = options or read_startup_options()
+    configured = (
+        os.environ.get("BACKUP_DB_RESTORE_CONFIG_BACKUP_PATH")
+        or source_options.get("config_backup_path")
+        or DEFAULT_OPTIONS["config_backup_path"]
+    )
+    configured_text = str(configured).strip() or DEFAULT_OPTIONS["config_backup_path"]
+    backup_path = Path(configured_text).expanduser()
+    if not backup_path.is_absolute():
+        backup_path = DATA_DIR / backup_path
+    return backup_path
+
+
+STARTUP_OPTIONS = read_startup_options()
+CACHE_DIR = configured_cache_dir(STARTUP_OPTIONS)
+UPLOAD_DIR = CACHE_DIR / "uploads"
+TMP_DIR = CACHE_DIR / "tmp"
 CURRENT_DB_BACKUP_DIR = DATA_DIR / "current-db-backups"
 REPORT_DIR = DATA_DIR / "import-reports"
 DIAGNOSTIC_DIR = DATA_DIR / "diagnostics"
 
-OPTIONS_PATH = DATA_DIR / "options.json"
 JOBS_PATH = DATA_DIR / "jobs.json"
 SOURCE_DB = CACHE_DIR / "source.db"
 SOURCE_ORIGINAL = CACHE_DIR / "source_original"
 SOURCE_META = CACHE_DIR / "source_meta.json"
 STATISTICS_TABLES = ("statistics_short_term", "statistics")
 BACKUP_FILE_EXTENSIONS = (".backup", ".tar", ".tar.gz", ".tgz", ".db", ".sqlite", ".sqlite3")
+CONFIG_BACKUP_EXTENSION = ".tar.gz"
+CONFIG_BACKUP_COMPONENTS: dict[str, dict[str, Any]] = {
+    "automations": {"label": "Automationen", "patterns": ["automations.yaml", ".storage/automation"]},
+    "scripts": {"label": "Skripte", "patterns": ["scripts.yaml", ".storage/script"]},
+    "scenes": {"label": "Szenen", "patterns": ["scenes.yaml", ".storage/scene"]},
+    "blueprints": {"label": "Blueprints", "patterns": ["blueprints"]},
+    "dashboards": {"label": "Dashboards", "patterns": [".storage/lovelace", ".storage/lovelace.*"]},
+    "helpers": {
+        "label": "Helpers und Registries",
+        "patterns": [
+            ".storage/core.area_registry",
+            ".storage/core.device_registry",
+            ".storage/core.entity_registry",
+            ".storage/core.floor_registry",
+            ".storage/core.label_registry",
+            ".storage/counter",
+            ".storage/group",
+            ".storage/input_*",
+            ".storage/person",
+            ".storage/schedule",
+            ".storage/timer",
+            ".storage/zone",
+        ],
+    },
+    "configuration": {
+        "label": "Konfiguration und Pakete",
+        "patterns": ["configuration.yaml", "customize.yaml", "packages", "custom_templates"],
+    },
+    "secrets": {"label": "Secrets", "patterns": ["secrets.yaml"], "sensitive": True},
+}
+DEFAULT_CONFIG_BACKUP_COMPONENTS = ("automations", "scripts", "scenes", "blueprints", "dashboards", "helpers")
 JOB_LOG_LIMIT = 300
 JOB_RETENTION_SECONDS = 6 * 60 * 60
 ANALYSIS_CACHE_TTL_SECONDS = 5 * 60
@@ -48,11 +131,11 @@ ACTIVE_JOB_STATUSES = {"queued", "running", "cancelling"}
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled"}
 SOURCE_CACHE_JOB_KINDS = {"upload", "load_backup", "load_corrupt_database", "refresh_cache"}
 SOURCE_READER_JOB_KINDS = {"import"}
-
-DEFAULT_OPTIONS = {
-    "database_path": "/homeassistant_config/home-assistant_v2.db",
-    "max_upload_mb": 131072,
-    "create_current_db_backup": True,
+CURRENT_DB_WRITER_JOB_KINDS = {
+    "import",
+    "restore_current_db",
+    "checkpoint_current_db",
+    "purge_entity_history",
 }
 
 ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
@@ -231,11 +314,14 @@ def active_job() -> dict[str, Any] | None:
 
 
 def conflicting_job_locked(kind: str) -> dict[str, Any] | None:
+    conflicting_kinds: set[str] = set()
     if kind in SOURCE_CACHE_JOB_KINDS:
-        conflicting_kinds = SOURCE_CACHE_JOB_KINDS | SOURCE_READER_JOB_KINDS
+        conflicting_kinds.update(SOURCE_CACHE_JOB_KINDS | SOURCE_READER_JOB_KINDS)
     elif kind in SOURCE_READER_JOB_KINDS:
-        conflicting_kinds = SOURCE_CACHE_JOB_KINDS
-    else:
+        conflicting_kinds.update(SOURCE_CACHE_JOB_KINDS)
+    if kind in CURRENT_DB_WRITER_JOB_KINDS:
+        conflicting_kinds.update(CURRENT_DB_WRITER_JOB_KINDS)
+    if not conflicting_kinds:
         return None
     for job in JOBS.values():
         if job["kind"] in conflicting_kinds and job["status"] in ACTIVE_JOB_STATUSES:
@@ -245,7 +331,7 @@ def conflicting_job_locked(kind: str) -> dict[str, Any] | None:
 
 def raise_job_conflict(conflict: dict[str, Any]) -> None:
     raise AppError(
-        "Es laeuft bereits ein Job, der den Quell-Cache verwendet.",
+        "Es laeuft bereits ein Job, der dieselben Datenbankdateien verwendet.",
         HTTPStatus.CONFLICT,
         {"active_job": conflict},
     )
@@ -389,8 +475,13 @@ def run_job(job_id: str, worker: Any, args: tuple[Any, ...]) -> None:
 
 
 def ensure_dirs() -> None:
+    if not CACHE_DIR.parent.exists():
+        raise RuntimeError(f"Cache parent directory does not exist: {CACHE_DIR.parent}")
     for path in (CACHE_DIR, UPLOAD_DIR, TMP_DIR, CURRENT_DB_BACKUP_DIR, REPORT_DIR, DIAGNOSTIC_DIR):
         path.mkdir(parents=True, exist_ok=True)
+    for path in (CACHE_DIR, UPLOAD_DIR, TMP_DIR):
+        if not os.access(path, os.R_OK | os.W_OK):
+            raise RuntimeError(f"Cache directory is not readable and writable: {path}")
 
 
 def read_options() -> dict[str, Any]:
@@ -404,6 +495,115 @@ def read_options() -> dict[str, Any]:
         except (OSError, json.JSONDecodeError):
             pass
     return options
+
+
+def write_options(options: dict[str, Any]) -> None:
+    OPTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = OPTIONS_PATH.with_name(f".{OPTIONS_PATH.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(options, handle, indent=2, sort_keys=True, default=json_default)
+        temp_path.replace(OPTIONS_PATH)
+    except OSError as err:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise AppError(f"Settings could not be saved: {err}") from err
+
+
+def normalized_path_setting(value: Any, default: str, *, relative_to_data: bool = False) -> str:
+    text = str(value or "").strip() or default
+    path = Path(text).expanduser()
+    if relative_to_data and not path.is_absolute():
+        path = DATA_DIR / path
+    return str(path)
+
+
+def normalize_settings_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(payload, dict):
+        raise AppError("Settings payload needs to be an object.")
+    current = read_options()
+    updated = current.copy()
+    updated["log_level"] = str(payload.get("log_level", current.get("log_level", "info"))).strip() or "info"
+    if updated["log_level"] not in VALID_LOG_LEVELS:
+        raise AppError("Unsupported log level.")
+
+    updated["database_path"] = normalized_path_setting(
+        payload.get("database_path", current.get("database_path")),
+        DEFAULT_OPTIONS["database_path"],
+    )
+    updated["cache_path"] = normalized_path_setting(
+        payload.get("cache_path", current.get("cache_path")),
+        DEFAULT_OPTIONS["cache_path"],
+        relative_to_data=True,
+    )
+    updated["config_backup_path"] = normalized_path_setting(
+        payload.get("config_backup_path", current.get("config_backup_path")),
+        DEFAULT_OPTIONS["config_backup_path"],
+        relative_to_data=True,
+    )
+
+    try:
+        updated["max_upload_mb"] = max(1, min(131072, int(payload.get("max_upload_mb", current.get("max_upload_mb", 131072)))))
+    except (TypeError, ValueError) as err:
+        raise AppError("Maximum upload size needs to be a number.") from err
+    updated["create_current_db_backup"] = bool(payload.get("create_current_db_backup", current.get("create_current_db_backup", True)))
+
+    validation = {
+        "database_path": file_info(Path(str(updated["database_path"]))),
+        "cache_path": storage_info(Path(str(updated["cache_path"]))),
+        "config_backup_path": storage_info(Path(str(updated["config_backup_path"]))),
+    }
+    for key in ("cache_path", "config_backup_path"):
+        configured = Path(str(updated[key]))
+        if not configured.parent.exists():
+            raise AppError(f"{key} parent directory does not exist: {configured.parent}")
+    return updated, validation
+
+
+def settings_status(options: dict[str, Any] | None = None) -> dict[str, Any]:
+    current = options or read_options()
+    configured_cache = configured_cache_dir(current)
+    configured_config_backup = configured_config_backup_dir(current)
+    restart_required = []
+    if configured_cache != CACHE_DIR:
+        restart_required.append("cache_path")
+    if str(current.get("log_level", "info")) != str(STARTUP_OPTIONS.get("log_level", "info")):
+        restart_required.append("log_level")
+    return {
+        "options": {
+            "log_level": str(current.get("log_level", "info")),
+            "database_path": str(current.get("database_path", DEFAULT_OPTIONS["database_path"])),
+            "cache_path": str(configured_cache),
+            "config_backup_path": str(configured_config_backup),
+            "max_upload_mb": int(current.get("max_upload_mb", 131072)),
+            "create_current_db_backup": bool(current.get("create_current_db_backup", True)),
+        },
+        "effective": {
+            "cache_path": str(CACHE_DIR),
+            "upload_dir": str(UPLOAD_DIR),
+            "tmp_dir": str(TMP_DIR),
+            "config_backup_path": str(config_backup_dir(current)),
+        },
+        "storage": {
+            "cache_path": storage_info(CACHE_DIR),
+            "configured_cache_path": storage_info(configured_cache),
+            "config_backup_path": storage_info(config_backup_dir(current)),
+        },
+        "restart_required": restart_required,
+    }
+
+
+def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if active_job():
+        raise AppError("Settings cannot be changed while a job is running.", HTTPStatus.CONFLICT)
+    updated, validation = normalize_settings_payload(payload)
+    write_options(updated)
+    status = settings_status(updated)
+    status["validation"] = validation
+    status["saved_at"] = now_iso()
+    return status
 
 
 def json_default(value: Any) -> Any:
@@ -441,6 +641,10 @@ def datetime_for_column(value: Any, column: str) -> Any:
     parsed = parse_datetime_value(value)
     if parsed is None:
         return None
+    return datetime_bound_for_column(parsed, column)
+
+
+def datetime_bound_for_column(parsed: datetime, column: str) -> Any:
     if column.endswith("_ts"):
         return parsed.timestamp()
     return parsed.isoformat().replace("+00:00", "Z")
@@ -516,6 +720,32 @@ def file_info(path: Path) -> dict[str, Any]:
         "readable": os.access(path, os.R_OK),
         "writable": os.access(path, os.W_OK),
     }
+
+
+def storage_info(path: Path) -> dict[str, Any]:
+    target = path if path.exists() else path.parent
+    result = {
+        "path": str(path),
+        "exists": path.exists(),
+        "readable": os.access(path, os.R_OK),
+        "writable": os.access(path, os.W_OK),
+        "free_bytes": None,
+        "total_bytes": None,
+        "used_bytes": None,
+        "error": None,
+    }
+    try:
+        usage = shutil.disk_usage(target)
+        result.update(
+            {
+                "free_bytes": usage.free,
+                "total_bytes": usage.total,
+                "used_bytes": usage.used,
+            }
+        )
+    except OSError as err:
+        result["error"] = str(err)
+    return result
 
 
 def database_sidecar_files(path: Path) -> dict[str, dict[str, Any]]:
@@ -1839,6 +2069,7 @@ def paginate_entities(entities: list[dict[str, Any]], offset: int, limit: int, f
 def empty_entity_summary(entity_id: str) -> dict[str, Any]:
     return {
         "entity_id": entity_id,
+        "datapoints_count": 0,
         "states_count": 0,
         "statistics_count": 0,
         "statistics_short_term_count": 0,
@@ -1849,16 +2080,70 @@ def empty_entity_summary(entity_id: str) -> dict[str, Any]:
     }
 
 
+def entity_summary_first_time(entity: dict[str, Any]) -> str | None:
+    values = [
+        str(value)
+        for value in (entity.get("first_seen"), entity.get("first_statistic"))
+        if value
+    ]
+    return min(values) if values else None
+
+
+def entity_summary_last_time(entity: dict[str, Any]) -> str | None:
+    values = [
+        str(value)
+        for value in (entity.get("last_seen"), entity.get("last_statistic"))
+        if value
+    ]
+    return max(values) if values else None
+
+
+def sort_entity_summaries(
+    entities: list[dict[str, Any]],
+    sort_by: str,
+    sort_order: str,
+) -> list[dict[str, Any]]:
+    reverse = sort_order == "desc"
+
+    def metric(entity: dict[str, Any]) -> int | str | None:
+        if sort_by == "datapoints":
+            return int(entity.get("datapoints_count") or 0)
+        if sort_by == "states":
+            return int(entity.get("states_count") or 0)
+        if sort_by == "statistics":
+            return int(entity.get("statistics_count") or 0) + int(entity.get("statistics_short_term_count") or 0)
+        if sort_by == "first_seen":
+            return entity_summary_first_time(entity)
+        if sort_by == "last_seen":
+            return entity_summary_last_time(entity)
+        return str(entity.get("entity_id") or "")
+
+    with_values = [entity for entity in entities if metric(entity) not in (None, "")]
+    without_values = [entity for entity in entities if metric(entity) in (None, "")]
+    return [
+        *sorted(
+            with_values,
+            key=lambda entity: (metric(entity), str(entity.get("entity_id") or "")),
+            reverse=reverse,
+        ),
+        *sorted(without_values, key=lambda entity: str(entity.get("entity_id") or "")),
+    ]
+
+
 def paginated_database_entities(
     path: Path,
     offset: int = 0,
     limit: int = 100,
     filter_text: str = "",
     immutable: bool = False,
+    sort_by: str = "entity_id",
+    sort_order: str = "asc",
 ) -> dict[str, Any]:
     bounded_limit = max(10, min(limit, 500))
     bounded_offset = max(0, offset)
     normalized_filter = filter_text.strip().lower()
+    normalized_sort = sort_by if sort_by in {"entity_id", "datapoints", "states", "statistics", "first_seen", "last_seen"} else "entity_id"
+    normalized_order = "desc" if str(sort_order).lower() == "desc" else "asc"
     if not path.exists() or not is_sqlite_file(path):
         return {
             "entities": [],
@@ -1868,6 +2153,8 @@ def paginated_database_entities(
             "has_next": False,
             "has_previous": False,
             "filter": filter_text,
+            "sort": normalized_sort,
+            "order": normalized_order,
         }
 
     try:
@@ -1912,15 +2199,24 @@ def paginated_database_entities(
                     "has_next": False,
                     "has_previous": False,
                     "filter": filter_text,
+                    "sort": normalized_sort,
+                    "order": normalized_order,
                 }
 
             union_sql = " UNION ".join(selects)
             total = int(conn.execute(f"SELECT COUNT(*) FROM ({union_sql}) entity_ids", params).fetchone()[0])
             bounded_offset = min(bounded_offset, total if total else 0)
-            entity_rows = conn.execute(
-                f"SELECT entity_id FROM ({union_sql}) entity_ids ORDER BY entity_id LIMIT ? OFFSET ?",
-                [*params, bounded_limit, bounded_offset],
-            ).fetchall()
+            if normalized_sort == "entity_id":
+                sql_order = "DESC" if normalized_order == "desc" else "ASC"
+                entity_rows = conn.execute(
+                    f"SELECT entity_id FROM ({union_sql}) entity_ids ORDER BY entity_id {sql_order} LIMIT ? OFFSET ?",
+                    [*params, bounded_limit, bounded_offset],
+                ).fetchall()
+            else:
+                entity_rows = conn.execute(
+                    f"SELECT entity_id FROM ({union_sql}) entity_ids ORDER BY entity_id",
+                    params,
+                ).fetchall()
             entity_ids = [str(row["entity_id"]) for row in entity_rows if row["entity_id"]]
             entities = {entity_id: empty_entity_summary(entity_id) for entity_id in entity_ids}
 
@@ -2002,18 +2298,32 @@ def paginated_database_entities(
                             if last_seen and (entities[entity_id]["last_statistic"] is None or str(last_seen) > str(entities[entity_id]["last_statistic"])):
                                 entities[entity_id]["last_statistic"] = last_seen
 
+            page_entities = [entities[entity_id] for entity_id in entity_ids]
+            for entity in page_entities:
+                entity["datapoints_count"] = (
+                    int(entity.get("states_count") or 0)
+                    + int(entity.get("statistics_count") or 0)
+                    + int(entity.get("statistics_short_term_count") or 0)
+                )
+
+            if normalized_sort != "entity_id":
+                page_entities = sort_entity_summaries(page_entities, normalized_sort, normalized_order)
+                page_entities = page_entities[bounded_offset : bounded_offset + bounded_limit]
+
             return {
-                "entities": [entities[entity_id] for entity_id in entity_ids],
+                "entities": page_entities,
                 "offset": bounded_offset,
                 "limit": bounded_limit,
                 "total": total,
                 "has_next": bounded_offset + bounded_limit < total,
                 "has_previous": bounded_offset > 0,
                 "filter": filter_text,
+                "sort": normalized_sort,
+                "order": normalized_order,
             }
     except sqlite3.DatabaseError as err:
         if not immutable:
-            page = paginated_database_entities(path, offset, limit, filter_text, immutable=True)
+            page = paginated_database_entities(path, offset, limit, filter_text, immutable=True, sort_by=sort_by, sort_order=sort_order)
             if page.get("error"):
                 page["error"] = f"{err}; immutable fallback: {page['error']}"
             else:
@@ -2027,6 +2337,8 @@ def paginated_database_entities(
             "has_next": False,
             "has_previous": False,
             "filter": filter_text,
+            "sort": normalized_sort,
+            "order": normalized_order,
             "error": str(err),
         }
 
@@ -2055,6 +2367,657 @@ def database_entity_exists(path: Path, entity_id: str, immutable: bool = False) 
             return database_entity_exists(path, entity_id, immutable=True)
         return False
     return False
+
+
+def current_database_path() -> Path:
+    options = read_options()
+    return Path(str(options["database_path"]))
+
+
+def paginated_current_entities(query: dict[str, list[str]]) -> dict[str, Any]:
+    current_db = current_database_path()
+    page = paginated_database_entities(
+        current_db,
+        query_int(query, "offset", 0),
+        query_int(query, "limit", 100),
+        query.get("filter", [""])[0],
+        sort_by=query.get("sort", ["entity_id"])[0],
+        sort_order=query.get("order", ["asc"])[0],
+    )
+    page["database_path"] = str(current_db)
+    return page
+
+
+def normalize_purge_entity_ids(payload: dict[str, Any]) -> list[str]:
+    raw_entity_ids = payload.get("entity_ids")
+    if raw_entity_ids is None:
+        raw_entity_ids = [payload.get("entity_id")]
+    if not isinstance(raw_entity_ids, list):
+        raise AppError("Entity selection needs to be a list.")
+
+    entity_ids: list[str] = []
+    for raw_entity_id in raw_entity_ids:
+        entity_id = str(raw_entity_id or "").strip()
+        if not entity_id:
+            continue
+        if not ENTITY_ID_RE.match(entity_id):
+            raise AppError(f"Entity id is invalid: {entity_id}")
+        if entity_id not in entity_ids:
+            entity_ids.append(entity_id)
+
+    if not entity_ids:
+        raise AppError("At least one entity needs to be selected.")
+    if len(entity_ids) > 500:
+        raise AppError("At most 500 entities can be purged at once.")
+    return entity_ids
+
+
+def purge_time_bounds(payload: dict[str, Any]) -> tuple[datetime | None, datetime | None]:
+    start = parse_datetime_value(payload.get("start"))
+    end = parse_datetime_value(payload.get("end"))
+    if start and end and start > end:
+        raise AppError("The purge start time must be before the end time.")
+    return start, end
+
+
+def qualified_column(column: str, alias: str | None = None) -> str:
+    return f"{alias}.{quote_identifier(column)}" if alias else quote_identifier(column)
+
+
+def placeholders(values: list[Any]) -> str:
+    return ", ".join("?" for _ in values)
+
+
+def append_time_where(
+    parts: list[str],
+    params: list[Any],
+    column: str | None,
+    start: datetime | None,
+    end: datetime | None,
+    alias: str | None = None,
+) -> bool:
+    if not start and not end:
+        return True
+    if not column:
+        return False
+    qualified = qualified_column(column, alias)
+    if start:
+        parts.append(f"{qualified} >= ?")
+        params.append(datetime_bound_for_column(start, column))
+    if end:
+        parts.append(f"{qualified} <= ?")
+        params.append(datetime_bound_for_column(end, column))
+    return True
+
+
+def existing_database_entity_ids(conn: sqlite3.Connection, tables: set[str], entity_ids: list[str]) -> set[str]:
+    existing: set[str] = set()
+    if not entity_ids:
+        return existing
+    sql_placeholders = placeholders(entity_ids)
+    if "states_meta" in tables and "entity_id" in column_names(conn, "states_meta"):
+        rows = conn.execute(
+            f"SELECT entity_id FROM states_meta WHERE entity_id IN ({sql_placeholders})",
+            entity_ids,
+        ).fetchall()
+        existing.update(str(row["entity_id"]) for row in rows)
+    if "statistics_meta" in tables and "statistic_id" in column_names(conn, "statistics_meta"):
+        rows = conn.execute(
+            f"SELECT statistic_id FROM statistics_meta WHERE statistic_id IN ({sql_placeholders})",
+            entity_ids,
+        ).fetchall()
+        existing.update(str(row["statistic_id"]) for row in rows)
+    if "states" in tables:
+        state_columns = column_names(conn, "states")
+        if "entity_id" in state_columns:
+            rows = conn.execute(
+                f"SELECT DISTINCT entity_id FROM states WHERE entity_id IN ({sql_placeholders})",
+                entity_ids,
+            ).fetchall()
+            existing.update(str(row["entity_id"]) for row in rows)
+    return existing
+
+
+def state_where_for_entities(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    entity_ids: list[str],
+    start: datetime | None,
+    end: datetime | None,
+    alias: str | None = None,
+) -> tuple[str, list[Any], list[str]]:
+    if "states" not in tables or not entity_ids:
+        return "", [], []
+    state_columns = column_names(conn, "states")
+    parts: list[str] = []
+    params: list[Any] = []
+    warnings: list[str] = []
+
+    if "states_meta" in tables and "metadata_id" in state_columns:
+        state_meta_columns = column_names(conn, "states_meta")
+        if "metadata_id" in state_meta_columns and "entity_id" in state_meta_columns:
+            rows = conn.execute(
+                f"SELECT metadata_id FROM states_meta WHERE entity_id IN ({placeholders(entity_ids)})",
+                entity_ids,
+            ).fetchall()
+            metadata_ids = [row["metadata_id"] for row in rows]
+            if metadata_ids:
+                parts.append(f"{qualified_column('metadata_id', alias)} IN ({placeholders(metadata_ids)})")
+                params.extend(metadata_ids)
+    elif "entity_id" in state_columns:
+        parts.append(f"{qualified_column('entity_id', alias)} IN ({placeholders(entity_ids)})")
+        params.extend(entity_ids)
+
+    if not parts:
+        return "", [], warnings
+
+    time_column = state_time_column_name(state_columns)
+    if not append_time_where(parts, params, time_column, start, end, alias):
+        warnings.append("States wurden uebersprungen, weil keine Zeitspalte vorhanden ist.")
+        return "", [], warnings
+    return " AND ".join(parts), params, warnings
+
+
+def statistics_metadata_ids_for_entities(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    entity_ids: list[str],
+) -> list[Any]:
+    if "statistics_meta" not in tables or not entity_ids:
+        return []
+    statistics_meta_columns = table_columns(conn, "statistics_meta")
+    statistics_meta_names = [str(column["name"]) for column in statistics_meta_columns]
+    statistics_meta_pk = statistics_meta_primary_key(statistics_meta_columns)
+    if not statistics_meta_pk or "statistic_id" not in statistics_meta_names:
+        return []
+    rows = conn.execute(
+        f"""
+        SELECT {quote_identifier(statistics_meta_pk)} AS metadata_id
+        FROM statistics_meta
+        WHERE statistic_id IN ({placeholders(entity_ids)})
+        """,
+        entity_ids,
+    ).fetchall()
+    return [row["metadata_id"] for row in rows]
+
+
+def statistics_where_for_entities(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    table: str,
+    entity_ids: list[str],
+    start: datetime | None,
+    end: datetime | None,
+) -> tuple[str, list[Any], list[str]]:
+    if table not in tables or "metadata_id" not in column_names(conn, table):
+        return "", [], []
+    metadata_ids = statistics_metadata_ids_for_entities(conn, tables, entity_ids)
+    if not metadata_ids:
+        return "", [], []
+    parts = [f"metadata_id IN ({placeholders(metadata_ids)})"]
+    params: list[Any] = list(metadata_ids)
+    start_column = start_time_column(column_names(conn, table))
+    if not append_time_where(parts, params, start_column, start, end):
+        return "", [], [f"{table} wurde uebersprungen, weil keine Zeitspalte vorhanden ist."]
+    return " AND ".join(parts), params, []
+
+
+def empty_purge_counts() -> dict[str, int]:
+    return {
+        "states": 0,
+        "state_attributes": 0,
+        "states_meta": 0,
+        "statistics": 0,
+        "statistics_short_term": 0,
+        "statistics_meta": 0,
+        "total_datapoints": 0,
+    }
+
+
+def normalize_purge_maintenance(payload: dict[str, Any]) -> str:
+    mode = str(payload.get("maintenance") or "none").strip().lower()
+    if mode not in {"none", "checkpoint", "vacuum", "checkpoint_vacuum"}:
+        raise AppError("Unsupported purge maintenance mode.")
+    return mode
+
+
+def state_metadata_ids_for_entities(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    entity_ids: list[str],
+) -> list[Any]:
+    if "states_meta" not in tables or "states" not in tables or not entity_ids:
+        return []
+    state_columns = column_names(conn, "states")
+    state_meta_columns = column_names(conn, "states_meta")
+    if "metadata_id" not in state_columns or "metadata_id" not in state_meta_columns or "entity_id" not in state_meta_columns:
+        return []
+    rows = conn.execute(
+        f"""
+        SELECT metadata_id
+        FROM states_meta
+        WHERE entity_id IN ({placeholders(entity_ids)})
+        """,
+        entity_ids,
+    ).fetchall()
+    return [row["metadata_id"] for row in rows]
+
+
+def count_selected_state_metadata_rows(
+    conn: sqlite3.Connection,
+    metadata_id: Any,
+    start: datetime | None,
+    end: datetime | None,
+) -> int:
+    state_columns = column_names(conn, "states")
+    parts = ["metadata_id = ?"]
+    params: list[Any] = [metadata_id]
+    if not append_time_where(parts, params, state_time_column_name(state_columns), start, end):
+        return 0
+    row = conn.execute(
+        f"SELECT COUNT(*) AS row_count FROM states WHERE {' AND '.join(parts)}",
+        params,
+    ).fetchone()
+    return int(row["row_count"] or 0)
+
+
+def count_selected_statistics_metadata_rows(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    metadata_id: Any,
+    start: datetime | None,
+    end: datetime | None,
+) -> int:
+    total = 0
+    for table in STATISTICS_TABLES:
+        if table not in tables or "metadata_id" not in column_names(conn, table):
+            continue
+        columns = column_names(conn, table)
+        parts = ["metadata_id = ?"]
+        params: list[Any] = [metadata_id]
+        if not append_time_where(parts, params, start_time_column(columns), start, end):
+            continue
+        row = conn.execute(
+            f"SELECT COUNT(*) AS row_count FROM {quote_identifier(table)} WHERE {' AND '.join(parts)}",
+            params,
+        ).fetchone()
+        total += int(row["row_count"] or 0)
+    return total
+
+
+def count_all_statistics_metadata_rows(conn: sqlite3.Connection, tables: set[str], metadata_id: Any) -> int:
+    total = 0
+    for table in STATISTICS_TABLES:
+        if table not in tables or "metadata_id" not in column_names(conn, table):
+            continue
+        row = conn.execute(
+            f"SELECT COUNT(*) AS row_count FROM {quote_identifier(table)} WHERE metadata_id = ?",
+            (metadata_id,),
+        ).fetchone()
+        total += int(row["row_count"] or 0)
+    return total
+
+
+def preview_empty_metadata_cleanup(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    entity_ids: list[str],
+    start: datetime | None,
+    end: datetime | None,
+) -> dict[str, int]:
+    counts = {"states_meta": 0, "statistics_meta": 0}
+
+    for metadata_id in state_metadata_ids_for_entities(conn, tables, entity_ids):
+        row = conn.execute(
+            "SELECT COUNT(*) AS row_count FROM states WHERE metadata_id = ?",
+            (metadata_id,),
+        ).fetchone()
+        total_rows = int(row["row_count"] or 0)
+        selected_rows = count_selected_state_metadata_rows(conn, metadata_id, start, end)
+        if total_rows - selected_rows <= 0:
+            counts["states_meta"] += 1
+
+    for metadata_id in statistics_metadata_ids_for_entities(conn, tables, entity_ids):
+        total_rows = count_all_statistics_metadata_rows(conn, tables, metadata_id)
+        selected_rows = count_selected_statistics_metadata_rows(conn, tables, metadata_id, start, end)
+        if total_rows - selected_rows <= 0:
+            counts["statistics_meta"] += 1
+
+    return counts
+
+
+def cleanup_empty_entity_metadata(
+    conn: sqlite3.Connection,
+    tables: set[str],
+    entity_ids: list[str],
+) -> dict[str, int]:
+    counts = {"states_meta": 0, "statistics_meta": 0}
+
+    state_metadata_ids = state_metadata_ids_for_entities(conn, tables, entity_ids)
+    if state_metadata_ids and "states_meta" in tables:
+        for metadata_id in state_metadata_ids:
+            row = conn.execute(
+                "SELECT 1 FROM states WHERE metadata_id = ? LIMIT 1",
+                (metadata_id,),
+            ).fetchone()
+            if row is not None:
+                continue
+            cursor = conn.execute("DELETE FROM states_meta WHERE metadata_id = ?", (metadata_id,))
+            counts["states_meta"] += max(0, int(cursor.rowcount or 0))
+
+    statistics_meta_columns = table_columns(conn, "statistics_meta") if "statistics_meta" in tables else []
+    statistics_meta_pk = statistics_meta_primary_key(statistics_meta_columns)
+    if statistics_meta_pk:
+        for metadata_id in statistics_metadata_ids_for_entities(conn, tables, entity_ids):
+            if count_all_statistics_metadata_rows(conn, tables, metadata_id) > 0:
+                continue
+            cursor = conn.execute(
+                f"DELETE FROM statistics_meta WHERE {quote_identifier(statistics_meta_pk)} = ?",
+                (metadata_id,),
+            )
+            counts["statistics_meta"] += max(0, int(cursor.rowcount or 0))
+
+    return counts
+
+
+def run_purge_database_maintenance(current_db: Path, mode: str) -> dict[str, Any]:
+    result: dict[str, Any] = {"mode": mode}
+    if mode == "none":
+        return result
+
+    if mode in {"checkpoint", "checkpoint_vacuum"}:
+        with open_db(current_db, readonly=False, timeout=60) as conn:
+            conn.execute("PRAGMA busy_timeout = 60000")
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            result["checkpoint"] = dict(row) if row is not None and row.keys() else (list(row) if row is not None else None)
+
+    if mode in {"vacuum", "checkpoint_vacuum"}:
+        before_size = current_db.stat().st_size if current_db.exists() else None
+        started_at = now_iso()
+        with open_db(current_db, readonly=False, timeout=120) as conn:
+            conn.execute("PRAGMA busy_timeout = 120000")
+            conn.execute("VACUUM")
+        after_size = current_db.stat().st_size if current_db.exists() else None
+        result["vacuum"] = {
+            "started_at": started_at,
+            "finished_at": now_iso(),
+            "before_size_bytes": before_size,
+            "after_size_bytes": after_size,
+        }
+
+    return result
+
+
+def count_table_range(
+    conn: sqlite3.Connection,
+    table: str,
+    where_sql: str,
+    params: list[Any],
+    time_column: str | None,
+) -> tuple[int, str | None, str | None]:
+    if not where_sql:
+        return 0, None, None
+    if time_column:
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS row_count,
+                   MIN({quote_identifier(time_column)}) AS first_seen,
+                   MAX({quote_identifier(time_column)}) AS last_seen
+            FROM {quote_identifier(table)}
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()
+        return int(row["row_count"] or 0), format_db_time(row["first_seen"]), format_db_time(row["last_seen"])
+    row = conn.execute(
+        f"SELECT COUNT(*) AS row_count FROM {quote_identifier(table)} WHERE {where_sql}",
+        params,
+    ).fetchone()
+    return int(row["row_count"] or 0), None, None
+
+
+def total_database_datapoints(conn: sqlite3.Connection, tables: set[str]) -> int:
+    total = 0
+    if "states" in tables:
+        total += int(conn.execute("SELECT COUNT(*) FROM states").fetchone()[0])
+    for table in STATISTICS_TABLES:
+        if table in tables:
+            total += int(conn.execute(f"SELECT COUNT(*) FROM {quote_identifier(table)}").fetchone()[0])
+    return total
+
+
+def preview_entity_history_purge(payload: dict[str, Any]) -> dict[str, Any]:
+    entity_ids = normalize_purge_entity_ids(payload)
+    start, end = purge_time_bounds(payload)
+    cleanup_metadata = bool(payload.get("cleanup_metadata", False))
+    maintenance = normalize_purge_maintenance(payload)
+    current_db = current_database_path()
+    if not current_db.exists():
+        raise AppError("Current Home Assistant database was not found.")
+    if not is_sqlite_file(current_db):
+        raise AppError("Current Home Assistant database path does not point to a SQLite database.")
+
+    with open_db(current_db, readonly=True) as conn:
+        tables = table_names(conn)
+        existing = existing_database_entity_ids(conn, tables, entity_ids)
+        missing = [entity_id for entity_id in entity_ids if entity_id not in existing]
+        if missing:
+            raise AppError("One or more entities were not found in the current database.", HTTPStatus.NOT_FOUND, {"missing_entities": missing})
+
+        totals = empty_purge_counts()
+        warnings: list[str] = []
+        entities: list[dict[str, Any]] = []
+        state_columns = column_names(conn, "states") if "states" in tables else []
+        state_time_column = state_time_column_name(state_columns)
+
+        for entity_id in entity_ids:
+            entity_counts = empty_purge_counts()
+            first_seen = None
+            last_seen = None
+            first_statistic = None
+            last_statistic = None
+
+            state_where, state_params, state_warnings = state_where_for_entities(conn, tables, [entity_id], start, end)
+            warnings.extend(state_warnings)
+            if state_where:
+                count, first_seen, last_seen = count_table_range(conn, "states", state_where, state_params, state_time_column)
+                entity_counts["states"] = count
+
+            for table in STATISTICS_TABLES:
+                statistics_where, statistics_params, statistics_warnings = statistics_where_for_entities(conn, tables, table, [entity_id], start, end)
+                warnings.extend(statistics_warnings)
+                start_column = start_time_column(column_names(conn, table)) if table in tables else None
+                count, table_first, table_last = count_table_range(conn, table, statistics_where, statistics_params, start_column)
+                entity_counts[table] = count
+                if table_first and (first_statistic is None or str(table_first) < str(first_statistic)):
+                    first_statistic = table_first
+                if table_last and (last_statistic is None or str(table_last) > str(last_statistic)):
+                    last_statistic = table_last
+
+            entity_counts["total_datapoints"] = (
+                entity_counts["states"]
+                + entity_counts["statistics"]
+                + entity_counts["statistics_short_term"]
+            )
+            for key in totals:
+                totals[key] += entity_counts[key]
+            entities.append(
+                {
+                    "entity_id": entity_id,
+                    "deleted": entity_counts,
+                    "first_seen": first_seen,
+                    "last_seen": last_seen,
+                    "first_statistic": first_statistic,
+                    "last_statistic": last_statistic,
+                }
+            )
+
+        state_where, state_params, state_warnings = state_where_for_entities(conn, tables, entity_ids, start, end)
+        warnings.extend(state_warnings)
+        if state_where and "state_attributes" in tables and "attributes_id" in state_columns and "attributes_id" in column_names(conn, "state_attributes"):
+            remaining_where, remaining_params, _ = state_where_for_entities(conn, tables, entity_ids, start, end, alias="remaining")
+            if remaining_where:
+                row = conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS row_count
+                    FROM (
+                        SELECT DISTINCT attributes_id
+                        FROM states
+                        WHERE {state_where} AND attributes_id IS NOT NULL
+                    ) selected
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM states remaining
+                        WHERE remaining.attributes_id = selected.attributes_id
+                        AND NOT ({remaining_where})
+                    )
+                    """,
+                    [*state_params, *remaining_params],
+                ).fetchone()
+                totals["state_attributes"] = int(row["row_count"] or 0)
+
+        database_size = current_db.stat().st_size
+        database_datapoints = total_database_datapoints(conn, tables)
+        estimated_bytes = 0
+        if database_datapoints > 0 and totals["total_datapoints"] > 0:
+            estimated_bytes = max(1, int(database_size * (totals["total_datapoints"] / database_datapoints)))
+
+        if cleanup_metadata:
+            metadata_cleanup = preview_empty_metadata_cleanup(conn, tables, entity_ids, start, end)
+            totals["states_meta"] = metadata_cleanup["states_meta"]
+            totals["statistics_meta"] = metadata_cleanup["statistics_meta"]
+
+    unique_warnings = list(dict.fromkeys(warnings))
+    return {
+        "entity_ids": entity_ids,
+        "entity_count": len(entity_ids),
+        "cleanup_metadata": cleanup_metadata,
+        "maintenance": maintenance,
+        "time_range": {
+            "start": start.isoformat().replace("+00:00", "Z") if start else None,
+            "end": end.isoformat().replace("+00:00", "Z") if end else None,
+        },
+        "entities": entities,
+        "deleted": totals,
+        "database_size_bytes": database_size,
+        "estimated_selected_bytes": estimated_bytes,
+        "estimated": True,
+        "warnings": unique_warnings,
+    }
+
+
+def purge_entity_histories(payload: dict[str, Any], job_id: str | None = None) -> dict[str, Any]:
+    preview = preview_entity_history_purge(payload)
+    entity_ids = list(preview["entity_ids"])
+    start, end = purge_time_bounds(payload)
+    cleanup_metadata = bool(preview.get("cleanup_metadata", False))
+    maintenance = str(preview.get("maintenance") or "none")
+    options = read_options()
+    current_db = Path(str(options["database_path"]))
+    backup_path = None
+    actual_deleted = empty_purge_counts()
+    estimated_deleted = preview["deleted"]
+    needs_write = (
+        int(estimated_deleted.get("total_datapoints") or 0) > 0
+        or (cleanup_metadata and (
+            int(estimated_deleted.get("states_meta") or 0) > 0
+            or int(estimated_deleted.get("statistics_meta") or 0) > 0
+        ))
+    )
+
+    if needs_write and bool(options.get("create_current_db_backup", True)):
+        backup_path = backup_current_database(current_db)
+
+    if needs_write:
+        try:
+            with open_db(current_db, readonly=False, timeout=30) as conn:
+                conn.execute("PRAGMA busy_timeout = 30000")
+                conn.execute("BEGIN IMMEDIATE")
+                tables = table_names(conn)
+                state_columns = column_names(conn, "states") if "states" in tables else []
+
+                state_where, state_params, _ = state_where_for_entities(conn, tables, entity_ids, start, end)
+                if state_where:
+                    if (
+                        "attributes_id" in state_columns
+                        and "state_attributes" in tables
+                        and "attributes_id" in column_names(conn, "state_attributes")
+                    ):
+                        conn.execute("CREATE TEMP TABLE IF NOT EXISTS purge_attribute_ids (attributes_id PRIMARY KEY)")
+                        conn.execute("DELETE FROM purge_attribute_ids")
+                        conn.execute(
+                            f"""
+                            INSERT OR IGNORE INTO purge_attribute_ids(attributes_id)
+                            SELECT DISTINCT attributes_id
+                            FROM states
+                            WHERE {state_where} AND attributes_id IS NOT NULL
+                            """,
+                            state_params,
+                        )
+                    cursor = conn.execute(f"DELETE FROM states WHERE {state_where}", state_params)
+                    actual_deleted["states"] = max(0, int(cursor.rowcount or 0))
+
+                    if (
+                        "attributes_id" in state_columns
+                        and "state_attributes" in tables
+                        and "attributes_id" in column_names(conn, "state_attributes")
+                    ):
+                        cursor = conn.execute(
+                            """
+                            DELETE FROM state_attributes
+                            WHERE attributes_id IN (SELECT attributes_id FROM purge_attribute_ids)
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM states
+                                WHERE states.attributes_id = state_attributes.attributes_id
+                            )
+                            """
+                        )
+                        actual_deleted["state_attributes"] = max(0, int(cursor.rowcount or 0))
+                        conn.execute("DELETE FROM purge_attribute_ids")
+
+                for table in STATISTICS_TABLES:
+                    statistics_where, statistics_params, _ = statistics_where_for_entities(conn, tables, table, entity_ids, start, end)
+                    if statistics_where:
+                        cursor = conn.execute(
+                            f"DELETE FROM {quote_identifier(table)} WHERE {statistics_where}",
+                            statistics_params,
+                        )
+                        actual_deleted[table] = max(0, int(cursor.rowcount or 0))
+
+                if cleanup_metadata:
+                    metadata_deleted = cleanup_empty_entity_metadata(conn, tables, entity_ids)
+                    actual_deleted["states_meta"] = metadata_deleted["states_meta"]
+                    actual_deleted["statistics_meta"] = metadata_deleted["statistics_meta"]
+
+                actual_deleted["total_datapoints"] = (
+                    actual_deleted["states"]
+                    + actual_deleted["statistics"]
+                    + actual_deleted["statistics_short_term"]
+                )
+                conn.commit()
+        except sqlite3.DatabaseError as err:
+            raise AppError(f"Entity history could not be purged: {err}") from err
+
+    maintenance_result = run_purge_database_maintenance(current_db, maintenance)
+
+    current_analysis = analyze_database(current_db)
+    remember_analysis(current_db, current_analysis)
+    preview.update(
+        {
+            "backup_path": backup_path,
+            "deleted": actual_deleted,
+            "maintenance_result": maintenance_result,
+            "current_database": current_analysis,
+            "restart_recommended": needs_write or maintenance != "none",
+        }
+    )
+    preview["report"] = write_purge_report(payload, preview, job_id)
+    return preview
+
+
+def purge_entity_history(entity_id: str) -> dict[str, Any]:
+    return purge_entity_histories({"entity_ids": [entity_id]})
 
 
 def candidate_score(member_name: str) -> int:
@@ -2322,8 +3285,12 @@ def cache_status() -> dict[str, Any]:
     analysis = source_cache_analysis(meta)
     return {
         "has_cached_database": SOURCE_DB.exists(),
+        "cache_dir": str(CACHE_DIR),
+        "upload_dir": str(UPLOAD_DIR),
+        "tmp_dir": str(TMP_DIR),
         "source_db": str(SOURCE_DB),
         "source_original": str(SOURCE_ORIGINAL) if SOURCE_ORIGINAL.exists() else None,
+        "storage": storage_info(CACHE_DIR),
         "meta": meta,
         "analysis": analysis,
     }
@@ -2485,6 +3452,581 @@ def restore_current_database_from_backup(backup_id: str) -> dict[str, Any]:
     }
 
 
+def ensure_writable_dir(path: Path, label: str) -> None:
+    if not path.parent.exists():
+        raise AppError(f"{label} parent directory does not exist: {path.parent}")
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as err:
+        raise AppError(f"{label} directory could not be created: {err}") from err
+    if not path.is_dir():
+        raise AppError(f"{label} path is not a directory: {path}")
+    if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+        raise AppError(f"{label} directory is not readable and writable: {path}")
+
+
+def config_backup_dir(options: dict[str, Any] | None = None) -> Path:
+    return configured_config_backup_dir(options or read_options())
+
+
+def ensure_config_backup_dir(options: dict[str, Any] | None = None) -> Path:
+    backup_dir = config_backup_dir(options)
+    ensure_writable_dir(backup_dir, "Config backup")
+    return backup_dir
+
+
+def safe_config_relative_path(value: Any) -> Path:
+    text = str(value or "").replace("\\", "/").strip()
+    if not text:
+        raise AppError("Config backup entry has an empty path.")
+    relative_path = Path(text)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise AppError(f"Config backup entry has an unsafe path: {text}")
+    return relative_path
+
+
+def resolve_config_relative_path(value: Any) -> Path:
+    relative_path = safe_config_relative_path(value)
+    root = CONFIG_DIR.resolve()
+    path = (CONFIG_DIR / relative_path).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as err:
+        raise AppError(f"Config path is outside the Home Assistant config directory: {relative_path}") from err
+    return path
+
+
+def sha256_file(path: Path, cancel_callback: Any = None) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            check_cancel(cancel_callback)
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_stream(stream: Any, cancel_callback: Any = None) -> str:
+    digest = hashlib.sha256()
+    while True:
+        check_cancel(cancel_callback)
+        chunk = stream.read(1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def normalize_config_backup_components(payload: dict[str, Any] | None) -> tuple[list[str], bool]:
+    source = payload or {}
+    include_secrets = bool(source.get("include_secrets", False))
+    raw_components = source.get("components")
+    if raw_components is None:
+        components = list(DEFAULT_CONFIG_BACKUP_COMPONENTS)
+    elif isinstance(raw_components, list):
+        components = [str(item).strip() for item in raw_components if str(item).strip()]
+    else:
+        raise AppError("Config backup components need to be a list.")
+
+    normalized: list[str] = []
+    for component in components:
+        if component not in CONFIG_BACKUP_COMPONENTS:
+            raise AppError(f"Unknown config backup component: {component}")
+        if CONFIG_BACKUP_COMPONENTS[component].get("sensitive") and not include_secrets:
+            raise AppError("Secrets need explicit include_secrets confirmation.")
+        if component not in normalized:
+            normalized.append(component)
+
+    if include_secrets and "secrets" not in normalized:
+        normalized.append("secrets")
+    if not normalized:
+        raise AppError("At least one config backup component needs to be selected.")
+    return normalized, include_secrets
+
+
+def collect_config_backup_files(components: list[str], cancel_callback: Any = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not CONFIG_DIR.exists():
+        raise AppError(f"Home Assistant config directory does not exist: {CONFIG_DIR}")
+    root = CONFIG_DIR.resolve()
+    files_by_path: dict[str, dict[str, Any]] = {}
+    missing: list[dict[str, Any]] = []
+
+    def add_file(path: Path, component: str) -> None:
+        check_cancel(cancel_callback)
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(root)
+            relative_path = path.relative_to(CONFIG_DIR).as_posix()
+            stat = resolved.stat()
+        except (OSError, ValueError):
+            return
+        if not resolved.is_file():
+            return
+        item = files_by_path.setdefault(
+            relative_path,
+            {
+                "path": resolved,
+                "relative_path": relative_path,
+                "components": [],
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
+                "mode": stat.st_mode & 0o777,
+            },
+        )
+        if component not in item["components"]:
+            item["components"].append(component)
+
+    for component in components:
+        component_config = CONFIG_BACKUP_COMPONENTS[component]
+        for pattern in component_config["patterns"]:
+            matches = sorted(CONFIG_DIR.glob(pattern)) if any(token in pattern for token in "*?[") else [CONFIG_DIR / pattern]
+            existing = [path for path in matches if path.exists()]
+            if not existing:
+                missing.append({"component": component, "pattern": pattern})
+                continue
+            for path in existing:
+                check_cancel(cancel_callback)
+                if path.is_dir():
+                    for child in sorted(path.rglob("*")):
+                        if child.is_file():
+                            add_file(child, component)
+                elif path.is_file():
+                    add_file(path, component)
+
+    return sorted(files_by_path.values(), key=lambda item: item["relative_path"]), missing
+
+
+def component_labels(components: list[str]) -> list[str]:
+    return [str(CONFIG_BACKUP_COMPONENTS.get(component, {}).get("label") or component) for component in components]
+
+
+def write_config_backup_archive(
+    files: list[dict[str, Any]],
+    components: list[str],
+    include_secrets: bool,
+    *,
+    reason: str,
+    missing: list[dict[str, Any]] | None = None,
+    cancel_callback: Any = None,
+) -> dict[str, Any]:
+    backup_dir = ensure_config_backup_dir()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    prefix = "ha-config-pre-restore" if reason == "pre_restore" else "ha-config"
+    archive_id = f"{prefix}-{timestamp}-{uuid.uuid4().hex[:8]}{CONFIG_BACKUP_EXTENSION}"
+    archive_path = backup_dir / archive_id
+    temp_path = backup_dir / f".{archive_id}.tmp"
+
+    total_size = sum(int(item.get("size_bytes") or 0) for item in files)
+    try:
+        if shutil.disk_usage(backup_dir).free < total_size + 1024 * 1024:
+            raise AppError("Not enough free space in the config backup directory.")
+    except OSError as err:
+        raise AppError(f"Could not check free config backup space: {err}") from err
+
+    manifest_files: list[dict[str, Any]] = []
+    for item in files:
+        check_cancel(cancel_callback)
+        path = Path(item["path"])
+        manifest_files.append(
+            {
+                "path": item["relative_path"],
+                "size_bytes": item["size_bytes"],
+                "modified": item["modified"],
+                "sha256": sha256_file(path, cancel_callback),
+                "components": item.get("components") or [],
+                "mode": item.get("mode"),
+            }
+        )
+
+    manifest = {
+        "id": archive_id,
+        "created_at": now_iso(),
+        "app": "backup_db_restore",
+        "app_version": APP_VERSION,
+        "reason": reason,
+        "config_dir": str(CONFIG_DIR),
+        "components": components,
+        "component_labels": component_labels(components),
+        "include_secrets": include_secrets,
+        "missing": missing or [],
+        "files": manifest_files,
+        "file_count": len(manifest_files),
+        "total_size_bytes": total_size,
+    }
+
+    try:
+        with tarfile.open(temp_path, "w:gz") as archive:
+            for item in files:
+                check_cancel(cancel_callback)
+                path = Path(item["path"])
+                stat = path.stat()
+                tar_info = tarfile.TarInfo(f"config/{item['relative_path']}")
+                tar_info.size = stat.st_size
+                tar_info.mtime = stat.st_mtime
+                tar_info.mode = int(item.get("mode") or (stat.st_mode & 0o777))
+                with path.open("rb") as handle:
+                    archive.addfile(tar_info, handle)
+
+            manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True, default=json_default).encode("utf-8")
+            manifest_info = tarfile.TarInfo("manifest.json")
+            manifest_info.size = len(manifest_bytes)
+            manifest_info.mtime = time.time()
+            manifest_info.mode = 0o644
+            archive.addfile(manifest_info, io.BytesIO(manifest_bytes))
+        temp_path.replace(archive_path)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+    return {
+        "id": archive_id,
+        "path": str(archive_path),
+        "manifest": manifest,
+        "storage": storage_info(backup_dir),
+    }
+
+
+def create_config_backup(payload: dict[str, Any] | None = None, cancel_callback: Any = None) -> dict[str, Any]:
+    components, include_secrets = normalize_config_backup_components(payload)
+    files, missing = collect_config_backup_files(components, cancel_callback)
+    if not files:
+        raise AppError("No matching Home Assistant config files were found for the selected components.")
+    return write_config_backup_archive(
+        files,
+        components,
+        include_secrets,
+        reason="manual",
+        missing=missing,
+        cancel_callback=cancel_callback,
+    )
+
+
+def list_config_backups(offset: int = 0, limit: int = 100) -> dict[str, Any]:
+    backup_dir = ensure_config_backup_dir()
+    files: list[dict[str, Any]] = []
+    for path in backup_dir.glob(f"*{CONFIG_BACKUP_EXTENSION}"):
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+            manifest = read_config_backup_manifest_from_path(path)
+        except (OSError, tarfile.TarError, json.JSONDecodeError, AppError):
+            manifest = {}
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+        files.append(
+            {
+                "id": path.name,
+                "name": path.name,
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
+                "created_at": manifest.get("created_at"),
+                "reason": manifest.get("reason"),
+                "file_count": manifest.get("file_count"),
+                "total_size_bytes": manifest.get("total_size_bytes"),
+                "component_labels": manifest.get("component_labels") or [],
+                "include_secrets": bool(manifest.get("include_secrets", False)),
+            }
+        )
+    files.sort(key=lambda item: (item.get("created_at") or item["modified"], item["name"]), reverse=True)
+    page = paginate_items(files, offset, limit)
+    return {
+        "backup_dir": str(backup_dir),
+        "config_dir": str(CONFIG_DIR),
+        "storage": storage_info(backup_dir),
+        "files": page["items"],
+        "offset": page["offset"],
+        "limit": page["limit"],
+        "total": page["total"],
+        "has_next": page["has_next"],
+        "has_previous": page["has_previous"],
+    }
+
+
+def resolve_config_backup(backup_id: str) -> Path:
+    safe_id = safe_artifact_id(backup_id)
+    backup_dir = ensure_config_backup_dir()
+    backup_root = backup_dir.resolve()
+    path = (backup_dir / safe_id).resolve()
+    try:
+        path.relative_to(backup_root)
+    except ValueError as err:
+        raise AppError("Config backup path is outside the config backup directory.") from err
+    if not path.is_file():
+        raise AppError("Selected config backup does not exist.")
+    if not path.name.endswith(CONFIG_BACKUP_EXTENSION):
+        raise AppError("Selected config backup is not a tar.gz archive.")
+    return path
+
+
+def read_config_backup_manifest_from_path(path: Path) -> dict[str, Any]:
+    with tarfile.open(path, "r:*") as archive:
+        try:
+            member = archive.getmember("manifest.json")
+        except KeyError as err:
+            raise AppError("Config backup has no manifest.") from err
+        extracted = archive.extractfile(member)
+        if extracted is None:
+            raise AppError("Config backup manifest could not be read.")
+        manifest = json.loads(extracted.read().decode("utf-8"))
+    if not isinstance(manifest, dict):
+        raise AppError("Config backup manifest is invalid.")
+    manifest.setdefault("id", path.name)
+    return manifest
+
+
+def validate_config_backup_archive(path: Path, cancel_callback: Any = None) -> dict[str, Any]:
+    with tarfile.open(path, "r:*") as archive:
+        try:
+            manifest_member = archive.getmember("manifest.json")
+        except KeyError as err:
+            raise AppError("Config backup upload has no manifest.") from err
+        if not manifest_member.isfile():
+            raise AppError("Config backup manifest is not a regular file.")
+        extracted_manifest = archive.extractfile(manifest_member)
+        if extracted_manifest is None:
+            raise AppError("Config backup manifest could not be read.")
+        try:
+            manifest = json.loads(extracted_manifest.read().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as err:
+            raise AppError(f"Config backup manifest is invalid: {err}") from err
+        if not isinstance(manifest, dict):
+            raise AppError("Config backup manifest needs to be an object.")
+        files = manifest.get("files")
+        if not isinstance(files, list) or not files:
+            raise AppError("Config backup manifest contains no files.")
+
+        allowed_members = {"manifest.json"}
+        for entry in files:
+            if not isinstance(entry, dict):
+                raise AppError("Config backup manifest contains an invalid file entry.")
+            relative_path = safe_config_relative_path(entry.get("path")).as_posix()
+            member_name = f"config/{relative_path}"
+            allowed_members.add(member_name)
+            try:
+                member = archive.getmember(member_name)
+            except KeyError as err:
+                raise AppError(f"Config backup upload is missing archive member: {member_name}") from err
+            if not member.isfile():
+                raise AppError(f"Config backup member is not a regular file: {member_name}")
+            if entry.get("size_bytes") is not None:
+                try:
+                    expected_size = int(entry["size_bytes"])
+                except (TypeError, ValueError) as err:
+                    raise AppError(f"Config backup member has an invalid size: {relative_path}") from err
+                if expected_size != int(member.size):
+                    raise AppError(f"Config backup member size mismatch: {relative_path}")
+            expected_sha = entry.get("sha256")
+            if expected_sha:
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise AppError(f"Config backup member could not be read: {member_name}")
+                actual_sha = sha256_stream(extracted, cancel_callback)
+                if actual_sha != expected_sha:
+                    raise AppError(f"Config backup checksum mismatch: {relative_path}")
+
+        for member in archive.getmembers():
+            check_cancel(cancel_callback)
+            if member.name not in allowed_members:
+                raise AppError(f"Config backup contains an unexpected archive member: {member.name}")
+
+    manifest.setdefault("id", path.name)
+    return manifest
+
+
+def config_backup_upload_name(original_name: str) -> str:
+    normalized = Path(original_name).name.strip() or f"ha-config-upload-{uuid.uuid4().hex[:8]}{CONFIG_BACKUP_EXTENSION}"
+    if normalized.endswith(".tgz"):
+        normalized = f"{normalized[:-4]}{CONFIG_BACKUP_EXTENSION}"
+    if not normalized.endswith(CONFIG_BACKUP_EXTENSION):
+        raise AppError("Config backup upload needs to be a .tar.gz archive.")
+    if not re.match(r"^[A-Za-z0-9_.-]+$", normalized) or normalized.startswith("."):
+        normalized = f"ha-config-upload-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}{CONFIG_BACKUP_EXTENSION}"
+    return normalized
+
+
+def unique_config_backup_path(file_name: str) -> Path:
+    backup_dir = ensure_config_backup_dir()
+    target = backup_dir / file_name
+    if not target.exists():
+        return target
+    stem = file_name[: -len(CONFIG_BACKUP_EXTENSION)]
+    for _ in range(20):
+        candidate = backup_dir / f"{stem}-{uuid.uuid4().hex[:8]}{CONFIG_BACKUP_EXTENSION}"
+        if not candidate.exists():
+            return candidate
+    raise AppError("Could not allocate a unique config backup upload name.")
+
+
+def import_config_backup_upload(upload_path: Path, original_name: str, cancel_callback: Any = None) -> dict[str, Any]:
+    manifest = validate_config_backup_archive(upload_path, cancel_callback)
+    target_path = unique_config_backup_path(config_backup_upload_name(original_name))
+    try:
+        upload_path.replace(target_path)
+    except OSError as err:
+        raise AppError(f"Config backup upload could not be stored: {err}") from err
+    manifest["id"] = target_path.name
+    return {
+        "id": target_path.name,
+        "path": str(target_path),
+        "manifest": manifest,
+        "storage": storage_info(target_path.parent),
+    }
+
+
+def read_config_backup(backup_id: str) -> dict[str, Any]:
+    backup_path = resolve_config_backup(backup_id)
+    return {
+        "id": backup_path.name,
+        "path": str(backup_path),
+        "manifest": read_config_backup_manifest_from_path(backup_path),
+    }
+
+
+def preview_config_backup_restore(backup_id: str) -> dict[str, Any]:
+    backup = read_config_backup(backup_id)
+    manifest = backup["manifest"]
+    changes: list[dict[str, Any]] = []
+    counts = {"same": 0, "changed": 0, "new": 0, "missing_backup_entry": 0, "conflict": 0}
+    for entry in manifest.get("files") or []:
+        relative_path = safe_config_relative_path(entry.get("path")).as_posix()
+        target = resolve_config_relative_path(relative_path)
+        item = {
+            "path": relative_path,
+            "backup_sha256": entry.get("sha256"),
+            "backup_size_bytes": entry.get("size_bytes"),
+            "status": "new",
+            "current_sha256": None,
+            "current_size_bytes": None,
+        }
+        if target.exists():
+            if not target.is_file():
+                item["status"] = "conflict"
+            else:
+                item["current_sha256"] = sha256_file(target)
+                try:
+                    item["current_size_bytes"] = target.stat().st_size
+                except OSError:
+                    item["current_size_bytes"] = None
+                item["status"] = "same" if item["current_sha256"] == entry.get("sha256") else "changed"
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
+        changes.append(item)
+
+    return {
+        "backup": backup,
+        "changes": changes,
+        "counts": counts,
+        "restart_recommended": True,
+        "storage": storage_info(config_backup_dir()),
+    }
+
+
+def create_pre_restore_config_backup(manifest: dict[str, Any], cancel_callback: Any = None) -> dict[str, Any] | None:
+    files: list[dict[str, Any]] = []
+    for entry in manifest.get("files") or []:
+        relative_path = safe_config_relative_path(entry.get("path")).as_posix()
+        path = resolve_config_relative_path(relative_path)
+        check_cancel(cancel_callback)
+        if not path.exists() or not path.is_file():
+            continue
+        stat = path.stat()
+        files.append(
+            {
+                "path": path,
+                "relative_path": relative_path,
+                "components": ["pre_restore"],
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
+                "mode": stat.st_mode & 0o777,
+            }
+        )
+    if not files:
+        return None
+    return write_config_backup_archive(
+        files,
+        ["pre_restore"],
+        include_secrets=any(item["relative_path"] == "secrets.yaml" for item in files),
+        reason="pre_restore",
+        cancel_callback=cancel_callback,
+    )
+
+
+def restore_config_backup(backup_id: str, cancel_callback: Any = None) -> dict[str, Any]:
+    backup_path = resolve_config_backup(backup_id)
+    manifest = read_config_backup_manifest_from_path(backup_path)
+    preview = preview_config_backup_restore(backup_id)
+    if preview["counts"].get("conflict"):
+        raise AppError("Config restore has path conflicts. Preview the backup before restoring.")
+
+    pre_restore_backup = create_pre_restore_config_backup(manifest, cancel_callback)
+    restored: list[dict[str, Any]] = []
+    with tarfile.open(backup_path, "r:*") as archive:
+        for entry in manifest.get("files") or []:
+            check_cancel(cancel_callback)
+            relative_path = safe_config_relative_path(entry.get("path")).as_posix()
+            target = resolve_config_relative_path(relative_path)
+            member_name = f"config/{relative_path}"
+            try:
+                member = archive.getmember(member_name)
+            except KeyError as err:
+                raise AppError(f"Config backup is missing archive member: {member_name}") from err
+            if not member.isfile():
+                raise AppError(f"Config backup member is not a regular file: {member_name}")
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise AppError(f"Config backup member could not be read: {member_name}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+            try:
+                copy_stream(extracted, temp_path, cancel_callback)
+                if entry.get("sha256") and sha256_file(temp_path, cancel_callback) != entry.get("sha256"):
+                    raise AppError(f"Config backup checksum mismatch: {relative_path}")
+                if entry.get("mode") is not None:
+                    try:
+                        temp_path.chmod(int(entry["mode"]))
+                    except (OSError, TypeError, ValueError):
+                        pass
+                temp_path.replace(target)
+            except Exception:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+                raise
+            restored.append({"path": relative_path, "size_bytes": entry.get("size_bytes"), "sha256": entry.get("sha256")})
+
+    return {
+        "restored_from": str(backup_path),
+        "pre_restore_backup": pre_restore_backup,
+        "restored": restored,
+        "restored_count": len(restored),
+        "restart_recommended": True,
+    }
+
+
+def compact_report_result(value: Any) -> Any:
+    if isinstance(value, list):
+        return [compact_report_result(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    compact: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "entities" and isinstance(item, list):
+            compact["entities_count"] = len(item)
+            compact["entities_omitted"] = True
+            continue
+        compact[key] = compact_report_result(item)
+    return compact
+
+
 def write_import_report(payload: dict[str, Any], result: dict[str, Any], job_id: str | None = None) -> dict[str, Any]:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -2500,10 +4042,35 @@ def write_import_report(payload: dict[str, Any], result: dict[str, Any], job_id:
     }
     report = {
         "id": report_id,
+        "kind": "import",
         "created_at": now_iso(),
         "job_id": job_id,
         "payload": safe_payload,
         "result": result,
+    }
+    with (REPORT_DIR / report_id).open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, sort_keys=True, default=json_default)
+    return {"id": report_id, "path": str(REPORT_DIR / report_id)}
+
+
+def write_purge_report(payload: dict[str, Any], result: dict[str, Any], job_id: str | None = None) -> dict[str, Any]:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    report_id = f"purge-{timestamp}-{uuid.uuid4().hex[:8]}.json"
+    safe_payload = {
+        "entity_ids": list(result.get("entity_ids") or payload.get("entity_ids") or []),
+        "start": (result.get("time_range") or {}).get("start") or payload.get("start"),
+        "end": (result.get("time_range") or {}).get("end") or payload.get("end"),
+        "cleanup_metadata": bool(result.get("cleanup_metadata") or payload.get("cleanup_metadata", False)),
+        "maintenance": result.get("maintenance") or payload.get("maintenance") or "none",
+    }
+    report = {
+        "id": report_id,
+        "kind": "purge",
+        "created_at": now_iso(),
+        "job_id": job_id,
+        "payload": safe_payload,
+        "result": compact_report_result(result),
     }
     with (REPORT_DIR / report_id).open("w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2, sort_keys=True, default=json_default)
@@ -2522,18 +4089,30 @@ def list_import_reports(offset: int = 0, limit: int = 50) -> dict[str, Any]:
             continue
         payload = report.get("payload") or {}
         result = report.get("result") or {}
+        kind = str(report.get("kind") or "import")
+        deleted = result.get("deleted") or {}
+        purge_entity_ids = payload.get("entity_ids") if isinstance(payload.get("entity_ids"), list) else []
+        purge_source = ", ".join(str(entity_id) for entity_id in purge_entity_ids[:2])
+        if len(purge_entity_ids) > 2:
+            purge_source = f"{purge_source}, ..."
         reports.append(
             {
                 "id": path.name,
+                "kind": kind,
                 "created_at": report.get("created_at"),
                 "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
-                "source_entity_id": payload.get("source_entity_id"),
-                "target_entity_id": payload.get("target_entity_id"),
+                "source_entity_id": payload.get("source_entity_id") or purge_source,
+                "target_entity_id": payload.get("target_entity_id") or ("Purge" if kind == "purge" else None),
                 "dry_run": payload.get("dry_run"),
                 "states_inserted": result.get("inserted"),
                 "states_skipped": result.get("skipped"),
                 "states_replaced": result.get("replaced"),
                 "statistics_inserted": (result.get("statistics") or {}).get("inserted"),
+                "states_deleted": deleted.get("states"),
+                "statistics_deleted": deleted.get("statistics"),
+                "statistics_short_term_deleted": deleted.get("statistics_short_term"),
+                "metadata_deleted": int(deleted.get("states_meta") or 0) + int(deleted.get("statistics_meta") or 0),
+                "backup_path": result.get("backup_path"),
             }
         )
     reports.sort(key=lambda item: (item.get("created_at") or "", item["id"]), reverse=True)
@@ -3457,6 +5036,38 @@ def job_checkpoint_current_db(job_id: str, mode: str = "PASSIVE") -> dict[str, A
     return result
 
 
+def job_purge_entity_history(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    entity_ids = normalize_purge_entity_ids(payload)
+    update_job(job_id, progress=10, message=f"History-Purge wird vorbereitet: {len(entity_ids)} Entitaet(en).")
+    result = purge_entity_histories(payload, job_id=job_id)
+    deleted = result.get("deleted") or {}
+    update_job(
+        job_id,
+        progress=90,
+        message=(
+            f"History-Purge abgeschlossen: {deleted.get('total_datapoints', 0)} Datenpunkt(e), "
+            f"{deleted.get('state_attributes', 0)} Attributzeile(n), "
+            f"{deleted.get('states_meta', 0) + deleted.get('statistics_meta', 0)} Metadatenzeile(n)."
+        ),
+    )
+    return result
+
+
+def job_create_config_backup(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    update_job(job_id, progress=10, message="Home-Assistant-Konfigurationsdateien werden gesammelt.")
+    result = create_config_backup(payload, cancel_callback=lambda: raise_if_cancelled(job_id))
+    update_job(job_id, progress=90, message=f"Konfig-Backup erstellt: {result['id']}")
+    return result
+
+
+def job_restore_config_backup(job_id: str, backup_id: str) -> dict[str, Any]:
+    update_job(job_id, progress=10, message=f"Konfig-Restore wird vorbereitet: {backup_id}")
+    raise_if_cancelled(job_id)
+    result = restore_config_backup(backup_id, cancel_callback=lambda: raise_if_cancelled(job_id))
+    update_job(job_id, progress=90, message=f"{result['restored_count']} Konfig-Datei(en) wiederhergestellt.")
+    return result
+
+
 def create_action_job(payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action", "")).strip()
     if action == "load_backup":
@@ -3483,6 +5094,23 @@ def create_action_job(payload: dict[str, Any]) -> dict[str, Any]:
         if not bool(payload.get("confirm", False)):
             raise AppError("WAL checkpoint needs explicit confirmation.")
         return start_job("checkpoint_current_db", "WAL-Checkpoint ausfuehren", job_checkpoint_current_db, str(payload.get("mode", "PASSIVE")))
+    if action == "purge_entity_history":
+        purge_payload = payload.get("payload")
+        if not isinstance(purge_payload, dict):
+            purge_payload = {"entity_id": str(payload.get("entity_id", "")).strip()}
+        if not bool(payload.get("confirm", False)):
+            raise AppError("History purge needs explicit confirmation.")
+        return start_job("purge_entity_history", "Entity-History loeschen", job_purge_entity_history, purge_payload)
+    if action == "config_backup":
+        backup_payload = payload.get("payload")
+        if not isinstance(backup_payload, dict):
+            backup_payload = {}
+        return start_job("config_backup", "Konfig-Backup erstellen", job_create_config_backup, backup_payload)
+    if action == "restore_config_backup":
+        backup_id = str(payload.get("backup_id", "")).strip()
+        if not bool(payload.get("confirm", False)):
+            raise AppError("Config restore needs explicit confirmation.")
+        return start_job("restore_config_backup", "Konfig-Backup wiederherstellen", job_restore_config_backup, backup_id)
     raise AppError("Unknown job action.")
 
 
@@ -3494,14 +5122,33 @@ def clear_cache() -> dict[str, Any]:
 def app_status() -> dict[str, Any]:
     options = read_options()
     current_db = Path(str(options["database_path"]))
+    config_dir = config_backup_dir(options)
     return {
         "time": now_iso(),
         "options": {
+            "log_level": str(options.get("log_level", "info")),
             "database_path": str(current_db),
+            "cache_path": str(CACHE_DIR),
+            "config_backup_path": str(config_dir),
             "max_upload_mb": int(options.get("max_upload_mb", 131072)),
             "create_current_db_backup": bool(options.get("create_current_db_backup", True)),
         },
+        "settings": settings_status(options),
         "cache": cache_status(),
+        "config_backup": {
+            "config_dir": str(CONFIG_DIR),
+            "backup_dir": str(config_dir),
+            "storage": storage_info(config_dir),
+            "components": [
+                {
+                    "id": component_id,
+                    "label": config["label"],
+                    "sensitive": bool(config.get("sensitive", False)),
+                    "default": component_id in DEFAULT_CONFIG_BACKUP_COMPONENTS,
+                }
+                for component_id, config in CONFIG_BACKUP_COMPONENTS.items()
+            ],
+        },
         "current_database": cached_analyze_database(current_db),
         "active_job": active_job(),
     }
@@ -3527,7 +5174,7 @@ def paginated_source_entities(query: dict[str, list[str]]) -> dict[str, Any]:
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "BackupDbRestore/0.5.8"
+    server_version = "BackupDbRestore/0.5.11"
 
     def do_GET(self) -> None:
         try:
@@ -3544,10 +5191,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "time": now_iso()})
             elif path == "/api/status":
                 self.send_json(app_status())
+            elif path == "/api/settings":
+                self.send_json(settings_status())
             elif path == "/api/source/entities":
                 self.send_json(paginated_source_entities(query))
             elif path == "/api/current/entities":
-                self.send_json(list_current_entities())
+                if any(name in query for name in ("offset", "limit", "filter")):
+                    self.send_json(paginated_current_entities(query))
+                else:
+                    self.send_json(list_current_entities())
             elif path == "/api/backups":
                 self.send_json(
                     list_device_backups(
@@ -3570,6 +5222,21 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_json(list_import_reports(offset=query_int(query, "offset", 0), limit=query_int(query, "limit", 50)))
             elif path.startswith("/api/reports/"):
                 self.send_json(read_import_report(path.rsplit("/", 1)[-1]))
+            elif path == "/api/config-backups":
+                self.send_json(list_config_backups(offset=query_int(query, "offset", 0), limit=query_int(query, "limit", 100)))
+            elif path.startswith("/api/config-backups/") and path.endswith("/download"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    raise AppError("Config backup was not found.", HTTPStatus.NOT_FOUND)
+                backup_path = resolve_config_backup(parts[2])
+                self.serve_download_file(backup_path, "application/gzip", backup_path.name)
+            elif path.startswith("/api/config-backups/") and path.endswith("/preview"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    raise AppError("Config backup was not found.", HTTPStatus.NOT_FOUND)
+                self.send_json(preview_config_backup_restore(parts[2]))
+            elif path.startswith("/api/config-backups/"):
+                self.send_json(read_config_backup(path.rsplit("/", 1)[-1]))
             elif path.startswith("/api/jobs/"):
                 self.send_json(get_job(path.rsplit("/", 1)[-1]))
             elif path == "/api/mapping/suggestions":
@@ -3591,6 +5258,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             parsed_url = urllib.parse.urlparse(self.path)
             path = parsed_url.path
+            if path == "/api/config-backups/upload":
+                self.handle_config_backup_upload()
+                return
             if path != "/api/upload":
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
@@ -3611,8 +5281,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif path == "/api/import/preview":
                 ensure_no_conflicting_job("import")
                 self.send_json(preflight_import(self.read_json()))
+            elif path == "/api/current/purge-preview":
+                ensure_no_conflicting_job("purge_entity_history")
+                self.send_json(preview_entity_history_purge(self.read_json()))
             elif path == "/api/jobs":
                 self.send_json(create_action_job(self.read_json()), status=HTTPStatus.ACCEPTED)
+            elif path == "/api/settings":
+                self.send_json(update_settings(self.read_json()))
             elif path.startswith("/api/jobs/") and path.endswith("/cancel"):
                 parts = path.strip("/").split("/")
                 if len(parts) != 4:
@@ -3694,6 +5369,38 @@ class RequestHandler(BaseHTTPRequestHandler):
             pass
         self.send_json(result)
 
+    def handle_config_backup_upload(self) -> None:
+        options = read_options()
+        max_bytes = int(options.get("max_upload_mb", 131072)) * 1024 * 1024
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length <= 0:
+            raise AppError("Upload is empty.")
+        if content_length > max_bytes:
+            raise AppError("Upload is larger than the configured limit.", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+
+        original_name = urllib.parse.unquote(self.headers.get("X-Filename") or "config-backup.tar.gz")
+        original_name = config_backup_upload_name(original_name)
+        backup_dir = ensure_config_backup_dir()
+        temp_path = backup_dir / f".upload-{uuid.uuid4().hex}.tmp"
+
+        remaining = content_length
+        try:
+            with temp_path.open("wb") as output:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            if remaining:
+                raise AppError("Upload ended before all bytes were received.")
+            self.send_json(import_config_backup_upload(temp_path, original_name), status=HTTPStatus.CREATED)
+        finally:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
     def read_json(self) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
         if content_length <= 0:
@@ -3715,6 +5422,20 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def serve_download_file(self, path: Path, content_type: str, file_name: str) -> None:
+        if not path.exists():
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        body = path.read_bytes()
+        quoted_name = urllib.parse.quote(file_name)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quoted_name}")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)

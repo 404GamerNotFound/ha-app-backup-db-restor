@@ -19,6 +19,8 @@
       <nav class="tabbar" aria-label="Arbeitsbereich">
         <button id="analysisTabButton" class="tab-button active" type="button" role="tab" aria-selected="true" aria-controls="analysisPage">Aktuelle DB-Analyse</button>
         <button id="importTabButton" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="importPage">Backup & Import</button>
+        <button id="configBackupTabButton" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="configBackupPage">Konfig-Backup</button>
+        <button id="settingsTabButton" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="settingsPage">Einstellungen</button>
       </nav>
 
       <section class="progress-panel" aria-label="Fortschritt">
@@ -70,6 +72,117 @@
           </div>
           <label class="confirm-line"><input id="confirmDbMaintenance" type="checkbox"> DB-Wartung bestaetigen</label>
           <pre id="currentDbDiagnosticsDetails" aria-live="polite"></pre>
+        </section>
+
+        <section class="panel current-entities-panel" aria-label="Aktuelle DB Entitaeten">
+          <div class="panel-header">
+            <h2>Aktuelle DB-Entitaeten</h2>
+            <div class="entity-toolbar">
+              <input id="currentEntityFilter" type="search" placeholder="Filtern">
+              <label>
+                Sortieren
+                <select id="currentEntitySortSelect">
+                  <option value="entity_id" selected>Entity-ID</option>
+                  <option value="datapoints">Datenpunkte</option>
+                  <option value="states">States</option>
+                  <option value="statistics">Statistikpunkte</option>
+                  <option value="first_seen">Erster Datenpunkt</option>
+                  <option value="last_seen">Letzter Datenpunkt</option>
+                </select>
+              </label>
+              <label>
+                Reihenfolge
+                <select id="currentEntityOrderSelect">
+                  <option value="asc" selected>Aufsteigend</option>
+                  <option value="desc">Absteigend</option>
+                </select>
+              </label>
+            </div>
+          </div>
+          <div class="top-entities-panel">
+            <div class="subhead">
+              <h3>Top Speicherfresser</h3>
+              <span class="muted-line">Nach Datenpunkten</span>
+            </div>
+            <div id="currentTopEntities" class="top-entities" aria-live="polite"></div>
+          </div>
+          <div class="purge-controls" aria-label="History-Purge">
+            <div class="purge-selection">
+              <strong id="currentEntitySelectionInfo">0 ausgewaehlt</strong>
+              <button id="clearCurrentSelectionButton" class="secondary small" type="button">Auswahl leeren</button>
+            </div>
+            <label>
+              Zeitraum
+              <select id="currentPurgeRangeMode">
+                <option value="all" selected>Alles</option>
+                <option value="before">Vor Datum</option>
+                <option value="after">Nach Datum</option>
+                <option value="between">Zwischen</option>
+                <option value="older_than">Aelter als Tage</option>
+              </select>
+            </label>
+            <label>
+              Von
+              <input id="currentPurgeStart" type="datetime-local">
+            </label>
+            <label>
+              Bis
+              <input id="currentPurgeEnd" type="datetime-local">
+            </label>
+            <label>
+              Tage
+              <input id="currentPurgeOlderDays" type="number" min="1" max="3650" step="1" value="90">
+            </label>
+            <label>
+              Metadaten
+              <span class="checkbox-line"><input id="cleanupCurrentMetadata" type="checkbox"> Leere Meta entfernen</span>
+            </label>
+            <label>
+              DB-Wartung
+              <select id="currentPurgeMaintenance">
+                <option value="none" selected>Keine</option>
+                <option value="checkpoint">WAL-Checkpoint</option>
+                <option value="vacuum">VACUUM</option>
+                <option value="checkpoint_vacuum">Checkpoint + VACUUM</option>
+              </select>
+            </label>
+            <div class="actions purge-actions">
+              <button id="previewCurrentPurgeButton" class="secondary" type="button">Vorschau</button>
+              <button id="executeCurrentPurgeButton" class="danger" type="button" disabled>Purge ausfuehren</button>
+            </div>
+          </div>
+          <div id="currentPurgePreview" class="purge-preview muted-line" aria-live="polite"></div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th><input id="currentEntitySelectAll" type="checkbox" aria-label="Sichtbare Entitaeten auswaehlen"></th>
+                  <th>Entity ID</th>
+                  <th>Datenpunkte</th>
+                  <th>States</th>
+                  <th>Statistik / Kurzzeit</th>
+                  <th>Von</th>
+                  <th>Bis</th>
+                  <th>Import</th>
+                </tr>
+              </thead>
+              <tbody id="currentDbEntities"></tbody>
+            </table>
+          </div>
+          <div class="pager" aria-label="Aktuelle-DB-Entitaeten-Paging">
+            <button id="prevCurrentEntityPageButton" class="secondary small" type="button">Zurueck</button>
+            <span id="currentEntityPageInfo">0-0 von 0</span>
+            <button id="nextCurrentEntityPageButton" class="secondary small" type="button">Weiter</button>
+            <label>
+              Pro Seite
+              <select id="currentEntityPageSizeSelect">
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="250">250</option>
+                <option value="500">500</option>
+              </select>
+            </label>
+          </div>
         </section>
 
         <section class="management-grid single-management" aria-label="Aktuelle Datenbank-Sicherungen">
@@ -147,13 +260,13 @@
           <div id="sourceMetaDetails" class="details-grid muted-line"></div>
         </section>
 
-        <section class="management-grid single-management" aria-label="Import-Reports">
+        <section class="management-grid single-management" aria-label="Reports">
           <article class="panel compact-panel">
             <div class="panel-header">
-              <h2>Import-Reports</h2>
+              <h2>Reports</h2>
               <button id="refreshReportsButton" class="secondary small" type="button">Aktualisieren</button>
             </div>
-            <select id="reportSelect" aria-label="Import-Report"></select>
+            <select id="reportSelect" aria-label="Report"></select>
             <div class="actions">
               <button id="openReportButton" type="button">Report anzeigen</button>
             </div>
@@ -239,6 +352,134 @@
             </div>
             <pre id="importResult" aria-live="polite"></pre>
           </aside>
+        </section>
+      </section>
+
+      <section id="configBackupPage" class="tab-page" role="tabpanel" aria-labelledby="configBackupTabButton" hidden>
+        <section class="status-grid" aria-label="Konfigurationsbackup Status">
+          <article class="status-box">
+            <span class="status-label">Konfig-Backup-Ziel</span>
+            <strong id="configBackupStorage">Unbekannt</strong>
+            <span id="configBackupDetails"></span>
+          </article>
+          <article class="status-box">
+            <span class="status-label">Konfig-Backups</span>
+            <strong id="configBackupCount">0</strong>
+            <span id="configBackupCountDetails"></span>
+          </article>
+        </section>
+
+        <section class="management-grid">
+          <article class="panel compact-panel">
+            <div class="panel-header">
+              <h2>Backup erstellen</h2>
+            </div>
+            <div class="option-grid">
+              <label><input class="config-component" type="checkbox" value="automations" checked> Automationen</label>
+              <label><input class="config-component" type="checkbox" value="scripts" checked> Skripte</label>
+              <label><input class="config-component" type="checkbox" value="scenes" checked> Szenen</label>
+              <label><input class="config-component" type="checkbox" value="blueprints" checked> Blueprints</label>
+              <label><input class="config-component" type="checkbox" value="dashboards" checked> Dashboards</label>
+              <label><input class="config-component" type="checkbox" value="helpers" checked> Helpers/Registries</label>
+              <label><input class="config-component" type="checkbox" value="configuration"> Konfiguration/Pakete</label>
+              <label><input id="includeConfigSecrets" class="config-component" type="checkbox" value="secrets"> Secrets</label>
+            </div>
+            <div class="actions">
+              <button id="createConfigBackupButton" type="button">Konfig sichern</button>
+              <button id="refreshConfigBackupsButton" class="secondary" type="button">Aktualisieren</button>
+            </div>
+            <div id="configBackupLocationDetails" class="details-grid muted-line"></div>
+          </article>
+
+          <article class="panel compact-panel">
+            <div class="panel-header">
+              <h2>Vorhandene Backups</h2>
+            </div>
+            <select id="configBackupSelect" aria-label="Konfig-Backup"></select>
+            <div class="actions">
+              <button id="inspectConfigBackupButton" type="button">Manifest anzeigen</button>
+              <button id="downloadConfigBackupButton" class="secondary" type="button">Download</button>
+              <button id="previewConfigRestoreButton" class="secondary" type="button">Restore pruefen</button>
+            </div>
+            <div class="actions">
+              <label class="confirm-line"><input id="confirmConfigRestore" type="checkbox"> Konfig-Restore bestaetigen</label>
+              <button id="restoreConfigBackupButton" type="button">Konfig wiederherstellen</button>
+            </div>
+            <div class="actions">
+              <label class="file-picker">
+                <input id="configBackupUploadInput" type="file" accept=".tar.gz,.tgz">
+                <span>Archiv waehlen</span>
+              </label>
+              <button id="uploadConfigBackupButton" class="secondary" type="button">Archiv hochladen</button>
+            </div>
+            <span id="configBackupUploadInfo" class="muted-line">Kein Archiv ausgewaehlt</span>
+            <span id="configBackupListInfo" class="muted-line"></span>
+          </article>
+        </section>
+
+        <section class="panel compact-panel">
+          <div class="panel-header">
+            <h2>Konfig-Backup Details</h2>
+          </div>
+          <pre id="configBackupResult" aria-live="polite"></pre>
+        </section>
+      </section>
+
+      <section id="settingsPage" class="tab-page" role="tabpanel" aria-labelledby="settingsTabButton" hidden>
+        <section class="status-grid" aria-label="Einstellungen Status">
+          <article class="status-box">
+            <span class="status-label">Cache-Speicher</span>
+            <strong id="settingsCacheStatus">Unbekannt</strong>
+            <span id="settingsCacheDetails"></span>
+          </article>
+          <article class="status-box">
+            <span class="status-label">Konfig-Backup-Ziel</span>
+            <strong id="settingsConfigBackupStatus">Unbekannt</strong>
+            <span id="settingsConfigBackupDetails"></span>
+          </article>
+        </section>
+
+        <section class="panel compact-panel">
+          <div class="panel-header">
+            <h2>Allgemeine Einstellungen</h2>
+            <div class="actions">
+              <button id="reloadSettingsButton" class="secondary small" type="button">Neu laden</button>
+              <button id="saveSettingsButton" type="button">Speichern</button>
+            </div>
+          </div>
+          <div class="settings-form">
+            <label>
+              Datenbankpfad
+              <input id="settingDatabasePath" type="text" autocomplete="off" spellcheck="false">
+            </label>
+            <label>
+              Cache-Pfad
+              <input id="settingCachePath" type="text" autocomplete="off" spellcheck="false">
+            </label>
+            <label>
+              Konfig-Backup-Pfad
+              <input id="settingConfigBackupPath" type="text" autocomplete="off" spellcheck="false">
+            </label>
+            <label>
+              Maximale Uploadgroesse MB
+              <input id="settingMaxUploadMb" type="number" min="1" max="131072" step="1">
+            </label>
+            <label>
+              Log-Level
+              <select id="settingLogLevel">
+                <option value="trace">trace</option>
+                <option value="debug">debug</option>
+                <option value="info">info</option>
+                <option value="notice">notice</option>
+                <option value="warning">warning</option>
+                <option value="error">error</option>
+                <option value="fatal">fatal</option>
+              </select>
+            </label>
+            <label class="confirm-line settings-check"><input id="settingCreateCurrentDbBackup" type="checkbox"> Aktuelle DB vor Schreibimport sichern</label>
+          </div>
+          <div id="settingsDetails" class="details-grid muted-line"></div>
+          <pre id="settingsResult" aria-live="polite"></pre>
         </section>
       </section>
     </main>

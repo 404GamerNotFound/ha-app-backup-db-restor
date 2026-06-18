@@ -5,6 +5,12 @@ configuration:
   database_path:
     name: "Datenbankpfad"
     description: "Pfad zur Home-Assistant-Datenbank im Container."
+  cache_path:
+    name: "Cache-Pfad"
+    description: "Beschreibbarer Pfad fuer Quell-Cache, Upload-Zwischenspeicher und temporaere Extraktionen. Fuer USB/externe Speicher z. B. einen Ordner unter /media oder /share verwenden."
+  config_backup_path:
+    name: "Konfig-Backup-Pfad"
+    description: "Beschreibbarer Pfad fuer selektive Home-Assistant-Konfigurationsbackups. Fuer USB/externe Speicher z. B. einen Ordner unter /media oder /share verwenden."
   max_upload_mb:
     name: "Maximale Uploadgroesse"
     description: "Maximale Dateigroesse fuer DB- oder Backup-Uploads in MB."

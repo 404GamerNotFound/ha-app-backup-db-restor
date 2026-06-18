@@ -1,6 +1,6 @@
 name: "Backup DB Restore"
 description: "Import Home Assistant recorder history from an uploaded backup database."
-version: "0.5.8"
+version: "0.5.11"
 slug: "backup_db_restore"
 stage: "experimental"
 init: false
@@ -20,16 +20,22 @@ map:
     read_only: true
   - type: share
     read_only: false
+  - type: media
+    read_only: false
   - type: homeassistant_config
     read_only: false
     path: /homeassistant_config
 options:
   log_level: "info"
   database_path: "/homeassistant_config/home-assistant_v2.db"
+  cache_path: "/data/cache"
+  config_backup_path: "/data/config-backups"
   max_upload_mb: 131072
   create_current_db_backup: true
 schema:
   log_level: "list(trace|debug|info|notice|warning|error|fatal)"
   database_path: "str"
+  cache_path: "str"
+  config_backup_path: "str"
   max_upload_mb: "int(1,131072)"
   create_current_db_backup: "bool"

@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.5.11
+
+- Neuer Tab `Einstellungen` ergaenzt. Allgemeine App-Optionen wie
+  Datenbankpfad, Cache-Pfad, Konfig-Backup-Pfad, Upload-Limit, Log-Level und
+  automatische aktuelle-DB-Sicherung koennen direkt in der Ingress-UI verwaltet
+  werden.
+- Neue Endpunkte `GET /api/settings` und `POST /api/settings` lesen und
+  speichern die allgemeinen Optionen atomar in `/data/options.json`.
+- Die Einstellungsseite zeigt freien Speicher fuer den konfigurierten
+  Cache-Pfad und das Konfig-Backup-Ziel an. Aenderungen am Cache-Pfad und
+  Log-Level werden als neustartpflichtig markiert.
+- Pfadvalidierung ergaenzt: Fuer Cache- und Konfig-Backup-Ziele muss der
+  Elternordner existieren, damit ein fehlender USB-/Media-Mount nicht
+  versehentlich als lokaler Ordner angelegt wird.
+
+## 0.5.10
+
+- Neuer dritter Tab `Konfig-Backup` fuer selektive Sicherungen von
+  Automationen, Skripten, Szenen, Blueprints, Dashboards, Helpers/Registries,
+  Paketen und optional `secrets.yaml`.
+- Neue Supervisor-Option `config_backup_path` ergaenzt. Konfig-Backups koennen
+  dadurch getrennt vom DB-Cache z. B. unter `/data`, `/share` oder `/media`
+  abgelegt werden.
+- Konfig-Backup-Archive enthalten ein `manifest.json` mit App-Version,
+  ausgewaehlten Bereichen, fehlenden optionalen Dateien, Dateigroessen und
+  SHA256-Pruefsummen.
+- Restore-Vorschau fuer Konfig-Backups ergaenzt. Sie vergleicht Manifest-
+  Pruefsummen mit der aktuellen Konfiguration und zeigt neue, geaenderte,
+  unveraenderte oder konfliktbehaftete Dateien.
+- Konfig-Backup-Archive koennen jetzt im Tab heruntergeladen und wieder
+  hochgeladen werden. Uploads werden vor der Uebernahme per Manifest,
+  erlaubten Archivpfaden, Dateigroessen und SHA256-Pruefsummen validiert.
+- Vor jedem Konfig-Restore erstellt die App automatisch ein Safety-Backup der
+  aktuell vorhandenen Dateien, die ueberschrieben werden.
+
+## 0.5.9
+
+- Neue Supervisor-Option `cache_path` ergaenzt. Die App legt dort
+  `source.db`, `source_meta.json`, optionale Originaldateien sowie die
+  Unterordner `uploads` und `tmp` ab.
+- `/media` wird read-write eingebunden, damit Cache-Verzeichnisse auf externen
+  bzw. USB-Speichern genutzt werden koennen, wenn Home Assistant sie dort
+  bereitstellt.
+- `/api/status` und die UI zeigen den aktiven Cache-Pfad und den freien
+  Speicher am Cache-Ziel an.
+
 ## 0.5.8
 
 - Grosse Quell-Datenbanken werden beim automatischen Laden ab 2 GB nur noch per

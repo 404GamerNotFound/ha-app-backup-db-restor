@@ -10,17 +10,108 @@ Instanz importiert werden kann.
 | --- | --- | --- | --- |
 | `log_level` | Liste | `info` | Log-Level fuer die App-Ausgabe. |
 | `database_path` | String | `/homeassistant_config/home-assistant_v2.db` | Pfad zur Home-Assistant-Datenbank im Container. |
+| `cache_path` | String | `/data/cache` | Beschreibbarer Cache-Pfad fuer geladene Quell-DB, Upload-Zwischenspeicher und temporaere Extraktionen. |
+| `config_backup_path` | String | `/data/config-backups` | Beschreibbarer Pfad fuer selektive Home-Assistant-Konfigurationsbackups. |
 | `max_upload_mb` | Integer | `131072` | Maximale Uploadgroesse in MB, entspricht 128 GB. |
 | `create_current_db_backup` | Boolean | `true` | Erstellt vor einem Schreibimport eine SQLite-Sicherung der aktuellen DB unter `/data/current-db-backups`. |
+
+## Einstellungsseite
+
+Der Tab `Einstellungen` buendelt die allgemeinen App-Optionen in der Ingress-UI.
+Bearbeitbar sind Datenbankpfad, Cache-Pfad, Konfig-Backup-Pfad, maximales
+Upload-Limit, Log-Level und die automatische aktuelle-DB-Sicherung vor
+Schreibimporten.
+
+Die UI liest diese Werte ueber `GET /api/settings` und speichert Aenderungen mit
+`POST /api/settings` atomar in `/data/options.json`. Waehrend ein Job laeuft,
+werden Aenderungen mit `409 Conflict` abgelehnt, damit Cache- oder
+Restore-Prozesse keine Pfade unter den Fuessen verlieren.
+
+Technische Wirkung der Optionen:
+
+- `database_path` wird beim naechsten Status-Refresh direkt fuer die Analyse der
+  aktuellen Recorder-Datenbank verwendet.
+- `config_backup_path` wird direkt fuer neue Konfig-Backups, Uploads und
+  Restore-Vorschauen verwendet.
+- `cache_path` wird beim App-Start in feste Laufzeitpfade wie `source.db`,
+  `uploads/` und `tmp/` aufgeloest. Eine Aenderung wird gespeichert, aber erst
+  nach einem App-/Add-on-Neustart aktiv.
+- `log_level` wird vom Startskript gesetzt und ist ebenfalls erst nach Neustart
+  voll wirksam.
+
+Fuer `cache_path` und `config_backup_path` muss der Elternordner bereits
+existieren. Das verhindert, dass ein nicht eingehangener USB-Stick unter
+`/media/...` versehentlich als leerer lokaler Ordner interpretiert wird. Die
+Einstellungsseite zeigt den konfigurierten Speicherort, den effektiven aktiven
+Pfad, freien Speicher und einen Neustart-Hinweis fuer neustartpflichtige
+Aenderungen an.
 
 ## Eingebundene Verzeichnisse
 
 - `/backup` ist read-only eingebunden und fuer Home-Assistant-Backups gedacht.
 - `/share` ist read-write eingebunden und kann fuer manuelle Artefakte genutzt werden.
+- `/media` ist read-write eingebunden und kann fuer externe Medien bzw. USB-
+  Speicher genutzt werden, wenn Home Assistant sie dort bereitstellt.
 - `/homeassistant_config` ist read-write eingebunden, damit History-Daten in die
   aktuelle Recorder-Datenbank geschrieben werden koennen.
-- `/data` speichert Upload-Cache, Job-nahe Artefakte, Job-Status in
+- `/data` speichert standardmaessig den Cache, Job-nahe Artefakte, Job-Status in
   `jobs.json`, Import-Reports und Sicherheitskopien persistent.
+
+## Externer Cache-Pfad
+
+Mit `cache_path` kann der Speicherort fuer grosse Quellartefakte verlegt werden.
+Die App legt dort die Cache-Datenbank `source.db`, die Metadaten
+`source_meta.json`, optionale Originaldateien sowie die Unterordner `uploads`
+und `tmp` an. Dadurch landen auch grosse Browser-Uploads und temporaere
+Backup-Extraktionen nicht mehr unter dem internen `/data`, sondern im
+konfigurierten Cache-Verzeichnis.
+
+Fuer USB- oder andere externe Speicher muss der Pfad innerhalb des Containers
+sichtbar und beschreibbar sein, z. B. `/media/usb/backup-db-restore-cache` oder
+`/share/backup-db-restore-cache`. Der Elternordner sollte bereits existieren,
+damit die App nicht versehentlich einen fehlenden USB-Mount als normalen Ordner
+anlegt. Die UI zeigt den aktiven Cache-Pfad und den dort freien Speicher unter
+`Geladene Quelle` an.
+
+## Konfig-Backups
+
+Der Tab `Konfig-Backup` erstellt selektive Sicherungen aus
+`/homeassistant_config`, ohne ein vollstaendiges Home-Assistant-Backup zu
+erzeugen. Das Zielverzeichnis kommt aus `config_backup_path` und kann wie der
+Cache auf `/data`, `/share` oder einem unter `/media` sichtbaren externen
+Speicher liegen.
+
+Auswaehlbar sind:
+
+- `automations`: `automations.yaml` und `.storage/automation`
+- `scripts`: `scripts.yaml` und `.storage/script`
+- `scenes`: `scenes.yaml` und `.storage/scene`
+- `blueprints`: `blueprints/`
+- `dashboards`: `.storage/lovelace*`
+- `helpers`: Entity-/Device-/Area-Registries und Helper-Speicher wie
+  `.storage/input_*`, `counter`, `timer`, `schedule`, `group`, `person`, `zone`
+- `configuration`: `configuration.yaml`, `customize.yaml`, `packages/`,
+  `custom_templates/`
+- `secrets`: `secrets.yaml`, nur wenn die Secrets-Checkbox explizit aktiv ist
+
+Jedes Archiv ist ein `tar.gz` mit `manifest.json`. Das Manifest enthaelt
+Erstellzeit, App-Version, ausgewaehlte Bereiche, fehlende optionale Dateien,
+Dateigroessen und SHA256-Pruefsummen. Die Restore-Vorschau vergleicht diese
+Pruefsummen mit der aktuellen Konfiguration und markiert Dateien als `same`,
+`changed`, `new` oder `conflict`.
+
+Vorhandene Konfig-Backup-Archive koennen im Tab heruntergeladen und spaeter
+wieder hochgeladen werden. Uploads werden vor der Uebernahme geprueft: Die App
+akzeptiert nur `tar.gz`-Archive mit Manifest, erwartet ausschliesslich
+`manifest.json` und die darin gelisteten `config/...`-Dateien und verifiziert
+Dateigroessen sowie SHA256-Pruefsummen.
+
+Vor jedem Konfig-Restore erstellt die App automatisch ein Safety-Backup der
+aktuell vorhandenen Dateien, die vom Restore ueberschrieben wuerden. Der Restore
+schreibt nur Dateien aus dem Manifest zurueck und entfernt keine zusaetzlichen
+aktuellen Dateien. Nach einem Restore ist ein Home-Assistant-Neustart empfohlen,
+damit Automationen, Skripte, Dashboards und `.storage`-Daten konsistent neu
+geladen werden.
 
 ## Importverhalten
 
@@ -170,8 +261,9 @@ Home-Assistant-Backup normalerweise die sicherste Loesung.
 ## API-Uebersicht
 
 - `PUT /api/upload?async=1`: speichert den Upload und startet einen Analyse-Job.
-- `POST /api/jobs`: startet Jobs fuer `load_backup`, `refresh_cache`, `import`
-  `restore_current_db`, `snapshot_current_db` und `checkpoint_current_db`.
+- `POST /api/jobs`: startet Jobs fuer `load_backup`, `refresh_cache`, `import`,
+  `restore_current_db`, `snapshot_current_db`, `checkpoint_current_db`,
+  `config_backup` und `restore_config_backup`.
 - `GET /api/jobs/{id}`: liefert Status, Fortschritt, Log, Ergebnis oder Fehler.
 - `POST /api/jobs/{id}/cancel`: fordert den kooperativen Abbruch eines laufenden
   Jobs an.
@@ -181,6 +273,15 @@ Home-Assistant-Backup normalerweise die sicherste Loesung.
 - `GET /api/mapping/suggestions`: liefert Ziel-Entity-Vorschlaege.
 - `GET /api/current-db-backups`: listet automatisch erzeugte aktuelle-DB-Sicherungen.
 - `GET /api/reports` und `GET /api/reports/{id}`: listen und lesen Import-Reports.
+- `GET /api/config-backups`: listet selektive Konfig-Backup-Archive.
+- `GET /api/config-backups/{id}`: liest Manifest und Metadaten eines Konfig-Backups.
+- `GET /api/config-backups/{id}/preview`: vergleicht ein Konfig-Backup mit der aktuellen Konfiguration.
+- `GET /api/config-backups/{id}/download`: laedt ein Konfig-Backup-Archiv herunter.
+- `PUT /api/config-backups/upload`: speichert ein hochgeladenes Konfig-Backup-Archiv nach Manifest- und Pruefsummenvalidierung.
+- `GET /api/settings`: liefert allgemeine Optionen, effektive Laufzeitpfade,
+  Speicherinformationen und neustartpflichtige Aenderungen.
+- `POST /api/settings`: validiert und speichert allgemeine Optionen in
+  `/data/options.json`; aktive Jobs blockieren die Aenderung mit `409 Conflict`.
 
 ## Sicherheitshinweise
 

@@ -5,6 +5,12 @@ configuration:
   database_path:
     name: "Database path"
     description: "Path to the Home Assistant database inside the container."
+  cache_path:
+    name: "Cache path"
+    description: "Writable path for source cache, upload staging, and temporary extractions. For USB or external storage, use a folder below /media or /share."
+  config_backup_path:
+    name: "Config backup path"
+    description: "Writable path for selective Home Assistant config backups. For USB or external storage, use a folder below /media or /share."
   max_upload_mb:
     name: "Maximum upload size"
     description: "Maximum file size for database or backup uploads in MB."
