@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.13
+
+- Grosse Recorder-Datenbanken werden nicht mehr als einzelner, lang laufender
+  PUT-Request hochgeladen. Die UI sendet nun 8-MB-Chunks, fragt nach
+  Verbindungsabbruechen den serverseitigen Offset ab und setzt den Upload bis zu
+  viermal automatisch fort. Dadurch bleiben 20-GB- und groessere Uploads auch
+  hinter Home-Assistant-Ingress stabil.
+- Der Fortschritt zeigt neben Prozent jetzt uebertragene und gesamte Bytes an.
+  Der Abbrechen-Button beendet auch laufende Chunk-Uploads und entfernt deren
+  temporaere Session-Dateien.
+- Beim App-Start und nach fehlgeschlagenen Legacy-Uploads werden unvollstaendige
+  Uploaddateien entfernt, damit wiederholte Abbrueche den Cache nicht mit
+  Teilkopien fuellen.
+- Direkt hochgeladene SQLite-Dateien werden nach der Analyse auf demselben
+  Cache-Dateisystem nach `source.db` verschoben, statt als Upload,
+  Arbeitskopie und Original mehrfach vollstaendig gespeichert zu werden.
+- Vor dem Upload prueft der Server den freien Speicher am konfigurierten
+  Cache-Pfad und meldet erforderliche sowie verfuegbare Bytes bei Platzmangel.
+
 ## 0.5.12
 
 - Bereich `Top Speicherfresser` in der aktuellen DB-Entity-Ansicht optisch
@@ -8,6 +27,14 @@
 - Top-Speicherfresser-Karten haben jetzt einen `Purge`-Shortcut. Der Button
   waehlt die Entity aus und laedt direkt die Purge-Vorschau; geloescht wird
   weiterhin erst nach explizitem Klick auf `Purge ausfuehren`.
+- Die aktuelle DB-Entity-Ansicht hat jetzt einen separaten Typfilter fuer
+  Entity-Domains. Eingaben wie `automation.*`, `sensor.*` oder
+  `binary_sensor.*` werden serverseitig mit Textfilter, Sortierung und Paging
+  kombiniert.
+- Aktuelle DB-Sicherungen koennen direkt in der UI geloescht werden. Vor dem
+  dauerhaften Entfernen ist eine Sicherheitsabfrage erforderlich; der Server
+  akzeptiert ausschliesslich `.db`-Dateien innerhalb des
+  Sicherungsverzeichnisses.
 
 ## 0.5.11
 

@@ -23,6 +23,7 @@ const state = {
     limit: 100,
     total: 0,
     filter: "",
+    type: "",
     sort: "entity_id",
     order: "asc",
   },
@@ -43,6 +44,7 @@ const state = {
   settings: null,
   resumedJobId: null,
   currentJobId: null,
+  activeUpload: null,
   isBusy: false,
 };
 
@@ -141,6 +143,8 @@ function setBusy(isBusy) {
     "previewButton",
     "importButton",
     "restoreDbButton",
+    "deleteCurrentDbBackupButton",
+    "currentDbBackupSelect",
     "refreshDbBackupsButton",
     "refreshReportsButton",
     "openReportButton",
@@ -148,6 +152,7 @@ function setBusy(isBusy) {
     "snapshotCurrentDbButton",
     "checkpointCurrentDbButton",
     "currentEntityFilter",
+    "currentEntityTypeFilter",
     "currentEntitySortSelect",
     "currentEntityOrderSelect",
     "currentEntitySelectAll",
@@ -200,36 +205,114 @@ async function api(path, options = {}) {
   return payload;
 }
 
-function uploadFileWithProgress(file) {
+function uploadChunkWithProgress(session, file, offset, end) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
-    request.open("PUT", "api/upload?async=1");
+    request.open("PUT", `api/uploads/${encodeURIComponent(session.id)}`);
     request.responseType = "json";
     request.setRequestHeader("Content-Type", "application/octet-stream");
-    request.setRequestHeader("X-Filename", encodeURIComponent(file.name));
+    request.setRequestHeader("X-Upload-Offset", String(offset));
+    if (state.activeUpload) {
+      state.activeUpload.request = request;
+    }
 
     request.upload.addEventListener("progress", (event) => {
-      if (!event.lengthComputable) {
-        setProgress(25, "Upload laeuft", true);
-        return;
-      }
-      const percent = Math.round((event.loaded / event.total) * 100);
-      setProgress(percent, `Upload ${percent}%`);
+      const loaded = Math.min(file.size, offset + Number(event.loaded || 0));
+      const percent = (loaded / file.size) * 100;
+      setProgress(percent, `Upload ${percent.toFixed(1)}% (${formatBytes(loaded)} / ${formatBytes(file.size)})`);
     });
 
     request.addEventListener("load", () => {
+      if (state.activeUpload) {
+        state.activeUpload.request = null;
+      }
       const payload = request.response || {};
       if (request.status >= 200 && request.status < 300) {
         resolve(payload);
       } else {
-        reject(new Error(payload.error || request.statusText || "Upload fehlgeschlagen"));
+        const error = new Error(payload.error || request.statusText || "Upload fehlgeschlagen");
+        error.payload = payload;
+        reject(error);
       }
     });
 
-    request.addEventListener("error", () => reject(new Error("Upload fehlgeschlagen")));
-    request.addEventListener("abort", () => reject(new Error("Upload abgebrochen")));
-    request.send(file);
+    request.addEventListener("error", () => {
+      if (state.activeUpload) {
+        state.activeUpload.request = null;
+      }
+      reject(new Error("Upload-Verbindung unterbrochen"));
+    });
+    request.addEventListener("abort", () => {
+      const error = new Error("Upload abgebrochen");
+      error.cancelled = true;
+      reject(error);
+    });
+    request.send(file.slice(offset, end));
   });
+}
+
+async function uploadFileWithProgress(file) {
+  let completed = false;
+  state.activeUpload = { id: null, cancelled: false, request: null };
+  updateCancelButton(null);
+  try {
+    const session = await api("api/uploads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: file.name, size: file.size }),
+    });
+    state.activeUpload.id = session.id;
+    if (state.activeUpload.cancelled) {
+      const error = new Error("Upload abgebrochen");
+      error.cancelled = true;
+      throw error;
+    }
+
+    const chunkSize = Number(session.chunk_size || 8 * 1024 * 1024);
+    let received = Number(session.received || 0);
+    let retries = 0;
+    while (received < file.size) {
+      if (state.activeUpload.cancelled) {
+        const error = new Error("Upload abgebrochen");
+        error.cancelled = true;
+        throw error;
+      }
+      const end = Math.min(file.size, received + chunkSize);
+      try {
+        const result = await uploadChunkWithProgress(session, file, received, end);
+        received = Number(result.received || end);
+        retries = 0;
+      } catch (error) {
+        if (error.cancelled || state.activeUpload.cancelled) throw error;
+        retries += 1;
+        if (retries > 4) {
+          throw new Error(`Upload nach ${retries} Versuchen fehlgeschlagen: ${error.message}`);
+        }
+        await sleep(retries * 750);
+        try {
+          const status = await api(`api/uploads/${encodeURIComponent(session.id)}`);
+          received = Number(status.received || 0);
+        } catch (statusError) {
+          appendLog(`Upload-Status noch nicht erreichbar: ${statusError.message}`);
+        }
+        appendLog(`Upload wird ab ${formatBytes(received)} fortgesetzt (Versuch ${retries}/4).`);
+      }
+    }
+
+    setProgress(100, "Upload vollstaendig. Analyse startet.");
+    const job = await api(`api/uploads/${encodeURIComponent(session.id)}/complete`, {
+      method: "POST",
+    });
+    completed = true;
+    return job;
+  } finally {
+    const activeUpload = state.activeUpload;
+    if (!completed && activeUpload?.id) {
+      await api(`api/uploads/${encodeURIComponent(activeUpload.id)}`, { method: "DELETE" }).catch(() => {});
+    }
+    state.activeUpload = null;
+    updateCancelButton(null);
+  }
 }
 
 function uploadConfigBackupWithProgress(file) {
@@ -280,6 +363,12 @@ function jobStatusLabel(job) {
 
 function updateCancelButton(job) {
   const button = $("cancelJobButton");
+  if (state.activeUpload) {
+    button.hidden = false;
+    button.disabled = Boolean(state.activeUpload.cancelled);
+    button.textContent = button.disabled ? "Wird abgebrochen" : "Upload abbrechen";
+    return;
+  }
   const canShow = job && CANCELLABLE_JOB_KINDS.includes(job.kind) && ACTIVE_JOB_STATUSES.includes(job.status);
   button.hidden = !canShow;
   if (!canShow) {
@@ -292,6 +381,16 @@ function updateCancelButton(job) {
 }
 
 async function cancelActiveJob() {
+  if (state.activeUpload) {
+    const activeUpload = state.activeUpload;
+    activeUpload.cancelled = true;
+    activeUpload.request?.abort();
+    updateCancelButton(null);
+    if (activeUpload.id) {
+      await api(`api/uploads/${encodeURIComponent(activeUpload.id)}`, { method: "DELETE" }).catch(() => {});
+    }
+    return;
+  }
   const jobId = state.currentJobId;
   if (!jobId) return;
   updateCancelButton({ id: jobId, kind: "import", status: "cancelling", cancel_requested: true });
@@ -1000,12 +1099,21 @@ function renderCorruptDatabases() {
 }
 
 function renderCurrentDbBackups() {
-  $("currentDbBackupSelect").innerHTML = state.currentDbBackups
+  const select = $("currentDbBackupSelect");
+  const previousSelection = select.value;
+  select.innerHTML = state.currentDbBackups
     .map((file) => {
       const label = `${file.name} (${formatBytes(file.size_bytes)}, ${formatDate(file.modified)})`;
       return `<option value="${escapeHtml(file.id)}">${escapeHtml(label)}</option>`;
     })
     .join("");
+  if (state.currentDbBackups.some((file) => file.id === previousSelection)) {
+    select.value = previousSelection;
+  }
+  const hasBackups = state.currentDbBackups.length > 0;
+  select.disabled = state.isBusy || !hasBackups;
+  $("restoreDbButton").disabled = state.isBusy || !hasBackups;
+  $("deleteCurrentDbBackupButton").disabled = state.isBusy || !hasBackups;
   $("currentDbBackupInfo").textContent = state.currentDbBackups.length
     ? `${state.currentDbBackups.length} Sicherung(en) geladen`
     : "Noch keine aktuelle-DB-Sicherung vorhanden";
@@ -1181,6 +1289,7 @@ async function fetchCurrentDbEntities() {
     offset: String(state.currentDbPage.offset),
     limit: String(state.currentDbPage.limit),
     filter: state.currentDbPage.filter,
+    type: state.currentDbPage.type,
     sort: state.currentDbPage.sort,
     order: state.currentDbPage.order,
   });
@@ -1191,9 +1300,11 @@ async function fetchCurrentDbEntities() {
     limit: payload.limit || state.currentDbPage.limit,
     total: payload.total || 0,
     filter: payload.filter || "",
+    type: payload.type || "",
     sort: payload.sort || state.currentDbPage.sort,
     order: payload.order || state.currentDbPage.order,
   };
+  $("currentEntityTypeFilter").value = state.currentDbPage.type;
   $("currentEntitySortSelect").value = state.currentDbPage.sort;
   $("currentEntityOrderSelect").value = state.currentDbPage.order;
   renderCurrentDbEntities();
@@ -1203,7 +1314,8 @@ async function fetchCurrentTopEntities() {
   const params = new URLSearchParams({
     offset: "0",
     limit: "10",
-    filter: "",
+    filter: state.currentDbPage.filter,
+    type: state.currentDbPage.type,
     sort: "datapoints",
     order: "desc",
   });
@@ -1572,6 +1684,34 @@ async function restoreCurrentDb() {
   }
 }
 
+async function deleteCurrentDbBackup() {
+  const backupId = $("currentDbBackupSelect").value;
+  if (!backupId) {
+    toast("Keine DB-Sicherung ausgewaehlt", "warn");
+    return;
+  }
+  const selected = state.currentDbBackups.find((backup) => backup.id === backupId);
+  const label = selected?.name || backupId;
+  if (!window.confirm(`DB-Sicherung wirklich dauerhaft loeschen?\n\n${label}`)) {
+    return;
+  }
+
+  setBusy(true);
+  try {
+    const result = await api(`api/current-db-backups/${encodeURIComponent(backupId)}`, {
+      method: "DELETE",
+    });
+    appendLog(`Aktuelle DB-Sicherung geloescht: ${result.id}`);
+    await refreshCurrentDbBackups();
+    toast("DB-Sicherung geloescht", "success");
+  } catch (error) {
+    handleOperationError(error);
+  } finally {
+    setBusy(false);
+    renderCurrentDbBackups();
+  }
+}
+
 async function reanalyzeCurrentDb() {
   setBusy(true);
   clearOperationLog();
@@ -1864,6 +2004,7 @@ function bindEvents() {
   $("loadCorruptDatabaseButton").addEventListener("click", loadCorruptDatabase);
   $("refreshDbBackupsButton").addEventListener("click", () => refreshCurrentDbBackups().catch((error) => toast(error.message, "error")));
   $("restoreDbButton").addEventListener("click", restoreCurrentDb);
+  $("deleteCurrentDbBackupButton").addEventListener("click", deleteCurrentDbBackup);
   $("refreshReportsButton").addEventListener("click", () => refreshReports().catch((error) => toast(error.message, "error")));
   $("openReportButton").addEventListener("click", openSelectedReport);
   $("reanalyzeCurrentDbButton").addEventListener("click", reanalyzeCurrentDb);
@@ -1927,7 +2068,15 @@ function bindEvents() {
     bindEvents.currentEntityFilterTimer = window.setTimeout(() => {
       state.currentDbPage.filter = $("currentEntityFilter").value.trim();
       state.currentDbPage.offset = 0;
-      fetchCurrentDbEntities().catch((error) => toast(error.message, "error"));
+      Promise.all([fetchCurrentDbEntities(), fetchCurrentTopEntities()]).catch((error) => toast(error.message, "error"));
+    }, 250);
+  });
+  $("currentEntityTypeFilter").addEventListener("input", () => {
+    window.clearTimeout(bindEvents.currentEntityTypeFilterTimer);
+    bindEvents.currentEntityTypeFilterTimer = window.setTimeout(() => {
+      state.currentDbPage.type = $("currentEntityTypeFilter").value.trim();
+      state.currentDbPage.offset = 0;
+      Promise.all([fetchCurrentDbEntities(), fetchCurrentTopEntities()]).catch((error) => toast(error.message, "error"));
     }, 250);
   });
   $("backupFilter").addEventListener("input", () => {

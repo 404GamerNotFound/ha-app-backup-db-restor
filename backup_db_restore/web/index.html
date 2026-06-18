@@ -80,6 +80,18 @@
             <div class="entity-toolbar">
               <input id="currentEntityFilter" type="search" placeholder="Filtern">
               <label>
+                Typ
+                <input id="currentEntityTypeFilter" list="currentEntityTypeList" type="text" placeholder="z. B. automation.*" autocomplete="off" spellcheck="false">
+                <datalist id="currentEntityTypeList">
+                  <option value="automation.*"></option>
+                  <option value="sensor.*"></option>
+                  <option value="binary_sensor.*"></option>
+                  <option value="switch.*"></option>
+                  <option value="light.*"></option>
+                  <option value="climate.*"></option>
+                </datalist>
+              </label>
+              <label>
                 Sortieren
                 <select id="currentEntitySortSelect">
                   <option value="entity_id" selected>Entity-ID</option>
@@ -195,6 +207,7 @@
             <div class="actions">
               <label class="confirm-line"><input id="confirmRestore" type="checkbox"> Restore bestaetigen</label>
               <button id="restoreDbButton" type="button">Aktuelle DB wiederherstellen</button>
+              <button id="deleteCurrentDbBackupButton" class="danger" type="button">Sicherung loeschen</button>
             </div>
             <span id="currentDbBackupInfo" class="muted-line"></span>
           </article>

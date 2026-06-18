@@ -30,7 +30,7 @@ DATA_DIR = Path(os.environ.get("BACKUP_DB_RESTORE_DATA_DIR", "/data"))
 BACKUP_DIR = Path(os.environ.get("BACKUP_DB_RESTORE_BACKUP_DIR", "/backup"))
 CONFIG_DIR = Path(os.environ.get("BACKUP_DB_RESTORE_CONFIG_DIR", "/homeassistant_config"))
 OPTIONS_PATH = DATA_DIR / "options.json"
-APP_VERSION = "0.5.11"
+APP_VERSION = "0.5.13"
 VALID_LOG_LEVELS = {"trace", "debug", "info", "notice", "warning", "error", "fatal"}
 DEFAULT_OPTIONS = {
     "log_level": "info",
@@ -127,6 +127,7 @@ JOB_LOG_LIMIT = 300
 JOB_RETENTION_SECONDS = 6 * 60 * 60
 ANALYSIS_CACHE_TTL_SECONDS = 5 * 60
 AUTOMATIC_DEEP_ANALYSIS_MAX_BYTES = 2 * 1024 * 1024 * 1024
+UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 ACTIVE_JOB_STATUSES = {"queued", "running", "cancelling"}
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled"}
 SOURCE_CACHE_JOB_KINDS = {"upload", "load_backup", "load_corrupt_database", "refresh_cache"}
@@ -141,6 +142,7 @@ CURRENT_DB_WRITER_JOB_KINDS = {
 ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
 JOB_LOCK = threading.Lock()
 JOBS: dict[str, dict[str, Any]] = {}
+UPLOAD_LOCK = threading.Lock()
 ANALYSIS_CACHE_LOCK = threading.Lock()
 ANALYSIS_CACHE: dict[str, dict[str, Any]] = {}
 
@@ -474,6 +476,17 @@ def run_job(job_id: str, worker: Any, args: tuple[Any, ...]) -> None:
             persist_jobs_locked()
 
 
+def cleanup_abandoned_upload_files() -> None:
+    for pattern in ("upload_*", "*.part", "*.json", "*.json.tmp"):
+        for path in UPLOAD_DIR.glob(pattern):
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def ensure_dirs() -> None:
     if not CACHE_DIR.parent.exists():
         raise RuntimeError(f"Cache parent directory does not exist: {CACHE_DIR.parent}")
@@ -482,6 +495,7 @@ def ensure_dirs() -> None:
     for path in (CACHE_DIR, UPLOAD_DIR, TMP_DIR):
         if not os.access(path, os.R_OK | os.W_OK):
             raise RuntimeError(f"Cache directory is not readable and writable: {path}")
+    cleanup_abandoned_upload_files()
 
 
 def read_options() -> dict[str, Any]:
@@ -2130,6 +2144,19 @@ def sort_entity_summaries(
     ]
 
 
+def normalize_entity_type_filter(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"", "*", "*.*"}:
+        return ""
+    if normalized.endswith(".*"):
+        normalized = normalized[:-2]
+    elif normalized.endswith("."):
+        normalized = normalized[:-1]
+    if not re.fullmatch(r"[a-z0-9_]+", normalized):
+        raise AppError("Entity type filter needs a domain such as automation.*.")
+    return normalized
+
+
 def paginated_database_entities(
     path: Path,
     offset: int = 0,
@@ -2138,10 +2165,13 @@ def paginated_database_entities(
     immutable: bool = False,
     sort_by: str = "entity_id",
     sort_order: str = "asc",
+    type_filter: str = "",
 ) -> dict[str, Any]:
     bounded_limit = max(10, min(limit, 500))
     bounded_offset = max(0, offset)
     normalized_filter = filter_text.strip().lower()
+    normalized_type = normalize_entity_type_filter(type_filter)
+    type_pattern = f"{normalized_type}.%" if normalized_type else ""
     normalized_sort = sort_by if sort_by in {"entity_id", "datapoints", "states", "statistics", "first_seen", "last_seen"} else "entity_id"
     normalized_order = "desc" if str(sort_order).lower() == "desc" else "asc"
     if not path.exists() or not is_sqlite_file(path):
@@ -2153,6 +2183,7 @@ def paginated_database_entities(
             "has_next": False,
             "has_previous": False,
             "filter": filter_text,
+            "type": f"{normalized_type}.*" if normalized_type else "",
             "sort": normalized_sort,
             "order": normalized_order,
         }
@@ -2170,6 +2201,9 @@ def paginated_database_entities(
                     if normalized_filter:
                         sql = f"{sql} AND lower(entity_id) LIKE ?"
                         params.append(f"%{normalized_filter}%")
+                    if normalized_type:
+                        sql = f"{sql} AND lower(entity_id) LIKE ?"
+                        params.append(type_pattern)
                     selects.append(sql)
 
             if "statistics_meta" in tables:
@@ -2179,6 +2213,9 @@ def paginated_database_entities(
                     if normalized_filter:
                         sql = f"{sql} AND lower(statistic_id) LIKE ?"
                         params.append(f"%{normalized_filter}%")
+                    if normalized_type:
+                        sql = f"{sql} AND lower(statistic_id) LIKE ?"
+                        params.append(type_pattern)
                     selects.append(sql)
 
             if not selects and "states" in tables:
@@ -2188,6 +2225,9 @@ def paginated_database_entities(
                     if normalized_filter:
                         sql = f"{sql} AND lower(entity_id) LIKE ?"
                         params.append(f"%{normalized_filter}%")
+                    if normalized_type:
+                        sql = f"{sql} AND lower(entity_id) LIKE ?"
+                        params.append(type_pattern)
                     selects.append(sql)
 
             if not selects:
@@ -2199,6 +2239,7 @@ def paginated_database_entities(
                     "has_next": False,
                     "has_previous": False,
                     "filter": filter_text,
+                    "type": f"{normalized_type}.*" if normalized_type else "",
                     "sort": normalized_sort,
                     "order": normalized_order,
                 }
@@ -2318,12 +2359,22 @@ def paginated_database_entities(
                 "has_next": bounded_offset + bounded_limit < total,
                 "has_previous": bounded_offset > 0,
                 "filter": filter_text,
+                "type": f"{normalized_type}.*" if normalized_type else "",
                 "sort": normalized_sort,
                 "order": normalized_order,
             }
     except sqlite3.DatabaseError as err:
         if not immutable:
-            page = paginated_database_entities(path, offset, limit, filter_text, immutable=True, sort_by=sort_by, sort_order=sort_order)
+            page = paginated_database_entities(
+                path,
+                offset,
+                limit,
+                filter_text,
+                immutable=True,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                type_filter=type_filter,
+            )
             if page.get("error"):
                 page["error"] = f"{err}; immutable fallback: {page['error']}"
             else:
@@ -2337,6 +2388,7 @@ def paginated_database_entities(
             "has_next": False,
             "has_previous": False,
             "filter": filter_text,
+            "type": f"{normalized_type}.*" if normalized_type else "",
             "sort": normalized_sort,
             "order": normalized_order,
             "error": str(err),
@@ -2383,6 +2435,7 @@ def paginated_current_entities(query: dict[str, list[str]]) -> dict[str, Any]:
         query.get("filter", [""])[0],
         sort_by=query.get("sort", ["entity_id"])[0],
         sort_order=query.get("order", ["asc"])[0],
+        type_filter=query.get("type", [""])[0],
     )
     page["database_path"] = str(current_db)
     return page
@@ -3159,6 +3212,42 @@ def cache_source_file(
             pass
 
 
+def cache_uploaded_sqlite(
+    upload_path: Path,
+    original_name: str,
+    cancel_callback: Any = None,
+) -> dict[str, Any]:
+    check_cancel(cancel_callback)
+    analysis = analyze_database_for_cache(upload_path)
+    if not analysis["sqlite_header"]:
+        raise AppError("The uploaded file is not a SQLite database.")
+
+    analysis_for_cache = copy.deepcopy(analysis)
+    analysis_for_cache["path"] = str(SOURCE_DB)
+    meta = {
+        "cached_at": now_iso(),
+        "source_kind": "upload",
+        "original_name": original_name,
+        "original_path": None,
+        "extract": {"kind": "sqlite", "selected_member": original_name},
+        "analysis": analysis_for_cache,
+        "entities_count": int(analysis.get("entities_count") or 0),
+    }
+
+    check_cancel(cancel_callback)
+    cleanup_source_database_files()
+    try:
+        SOURCE_ORIGINAL.unlink()
+    except FileNotFoundError:
+        pass
+    upload_path.replace(SOURCE_DB)
+    meta["analysis"]["sidecars"] = database_sidecar_files(SOURCE_DB)
+    meta["analysis"]["diagnostics"] = build_database_diagnostics(meta["analysis"])
+    remember_analysis(SOURCE_DB, meta["analysis"])
+    write_source_meta(meta)
+    return {"meta": meta, "entities_count": meta["entities_count"], "entities_omitted": True}
+
+
 def copy_recovery_sidecars(
     source_path: Path,
     destination_db: Path = SOURCE_DB,
@@ -3265,7 +3354,9 @@ def cache_corrupt_database(file_id: str, cancel_callback: Any = None) -> dict[st
 
 
 def handle_uploaded_file(upload_path: Path, original_name: str, cancel_callback: Any = None) -> dict[str, Any]:
-    return cache_source_file(upload_path, original_name, "upload", copy_original=True, cancel_callback=cancel_callback)
+    if is_sqlite_file(upload_path):
+        return cache_uploaded_sqlite(upload_path, original_name, cancel_callback)
+    return cache_source_file(upload_path, original_name, "upload", copy_original=False, cancel_callback=cancel_callback)
 
 
 def handle_device_backup_file(file_id: str, cancel_callback: Any = None) -> dict[str, Any]:
@@ -3420,7 +3511,7 @@ def list_current_db_backups(offset: int = 0, limit: int = 100) -> dict[str, Any]
     }
 
 
-def resolve_current_db_backup(backup_id: str) -> Path:
+def current_db_backup_file_path(backup_id: str) -> Path:
     safe_id = safe_artifact_id(backup_id)
     backup_root = CURRENT_DB_BACKUP_DIR.resolve()
     path = (CURRENT_DB_BACKUP_DIR / safe_id).resolve()
@@ -3430,9 +3521,31 @@ def resolve_current_db_backup(backup_id: str) -> Path:
         raise AppError("Backup path is outside the current DB backup directory.") from err
     if not path.is_file():
         raise AppError("Selected current DB backup does not exist.")
+    if path.suffix.lower() != ".db":
+        raise AppError("Selected current DB backup is not a .db file.")
+    return path
+
+
+def resolve_current_db_backup(backup_id: str) -> Path:
+    path = current_db_backup_file_path(backup_id)
     if not is_sqlite_file(path):
         raise AppError("Selected current DB backup is not a SQLite database.")
     return path
+
+
+def delete_current_db_backup(backup_id: str) -> dict[str, Any]:
+    path = current_db_backup_file_path(backup_id)
+    try:
+        size_bytes = path.stat().st_size
+        path.unlink()
+    except OSError as err:
+        raise AppError(f"Current DB backup could not be deleted: {err}") from err
+    return {
+        "deleted": True,
+        "id": path.name,
+        "size_bytes": size_bytes,
+        "backup_dir": str(CURRENT_DB_BACKUP_DIR),
+    }
 
 
 def restore_current_database_from_backup(backup_id: str) -> dict[str, Any]:
@@ -5173,8 +5286,208 @@ def paginated_source_entities(query: dict[str, list[str]]) -> dict[str, Any]:
     return page
 
 
+def normalized_upload_id(upload_id: str) -> str:
+    normalized = str(upload_id or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{32}", normalized):
+        raise AppError("Upload session was not found.", HTTPStatus.NOT_FOUND)
+    return normalized
+
+
+def upload_session_paths(upload_id: str) -> tuple[Path, Path]:
+    normalized = normalized_upload_id(upload_id)
+    return UPLOAD_DIR / f"{normalized}.part", UPLOAD_DIR / f"{normalized}.json"
+
+
+def write_upload_session(session: dict[str, Any]) -> None:
+    _, metadata_path = upload_session_paths(str(session["id"]))
+    temp_path = metadata_path.with_suffix(".json.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(session, handle, indent=2, sort_keys=True, default=json_default)
+        temp_path.replace(metadata_path)
+    except OSError as err:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise AppError(f"Upload session could not be saved: {err}") from err
+
+
+def read_upload_session(upload_id: str) -> dict[str, Any]:
+    part_path, metadata_path = upload_session_paths(upload_id)
+    if not part_path.is_file() or not metadata_path.is_file():
+        raise AppError("Upload session was not found.", HTTPStatus.NOT_FOUND)
+    try:
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            session = json.load(handle)
+    except (OSError, json.JSONDecodeError) as err:
+        raise AppError(f"Upload session could not be read: {err}") from err
+    if not isinstance(session, dict):
+        raise AppError("Upload session metadata is invalid.")
+    return session
+
+
+def public_upload_session(session: dict[str, Any]) -> dict[str, Any]:
+    part_path, _ = upload_session_paths(str(session["id"]))
+    received = part_path.stat().st_size if part_path.exists() else int(session.get("received") or 0)
+    total_size = int(session.get("size") or 0)
+    return {
+        "id": session["id"],
+        "filename": session["filename"],
+        "size": total_size,
+        "received": received,
+        "complete": total_size > 0 and received == total_size,
+        "chunk_size": UPLOAD_CHUNK_SIZE_BYTES,
+        "created_at": session.get("created_at"),
+        "updated_at": session.get("updated_at"),
+    }
+
+
+def create_upload_session(payload: dict[str, Any]) -> dict[str, Any]:
+    ensure_no_conflicting_job("upload")
+    original_name = Path(str(payload.get("filename") or "upload")).name or "upload"
+    try:
+        total_size = int(payload.get("size"))
+    except (TypeError, ValueError) as err:
+        raise AppError("Upload size is invalid.") from err
+    if total_size <= 0:
+        raise AppError("Upload is empty.")
+
+    options = read_options()
+    max_bytes = int(options.get("max_upload_mb", 131072)) * 1024 * 1024
+    if total_size > max_bytes:
+        raise AppError("Upload is larger than the configured limit.", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+
+    storage = storage_info(UPLOAD_DIR)
+    free_bytes = storage.get("free_bytes")
+    if free_bytes is not None and int(free_bytes) < total_size + 64 * 1024 * 1024:
+        raise AppError(
+            "Not enough free space at the configured cache path.",
+            details={"required_bytes": total_size, "free_bytes": int(free_bytes)},
+        )
+
+    upload_id = uuid.uuid4().hex
+    part_path, _ = upload_session_paths(upload_id)
+    session = {
+        "id": upload_id,
+        "filename": original_name,
+        "size": total_size,
+        "received": 0,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    with UPLOAD_LOCK:
+        try:
+            with part_path.open("xb"):
+                pass
+        except OSError as err:
+            raise AppError(f"Upload session could not be created: {err}") from err
+        try:
+            write_upload_session(session)
+        except Exception:
+            try:
+                part_path.unlink()
+            except OSError:
+                pass
+            raise
+    return public_upload_session(session)
+
+
+def append_upload_chunk(
+    upload_id: str,
+    expected_offset: int,
+    content_length: int,
+    source: Any,
+) -> dict[str, Any]:
+    if content_length <= 0:
+        raise AppError("Upload chunk is empty.")
+    if content_length > UPLOAD_CHUNK_SIZE_BYTES:
+        raise AppError("Upload chunk is larger than the supported chunk size.")
+
+    with UPLOAD_LOCK:
+        session = read_upload_session(upload_id)
+        part_path, _ = upload_session_paths(upload_id)
+        current_size = part_path.stat().st_size
+        total_size = int(session.get("size") or 0)
+        if expected_offset != current_size:
+            raise AppError(
+                "Upload offset does not match the stored data.",
+                HTTPStatus.CONFLICT,
+                {"expected_offset": current_size},
+            )
+        if current_size + content_length > total_size:
+            raise AppError("Upload chunk exceeds the declared file size.")
+
+        remaining = content_length
+        try:
+            with part_path.open("ab") as output:
+                while remaining > 0:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            if remaining:
+                with part_path.open("r+b") as output:
+                    output.truncate(current_size)
+                raise AppError("Upload chunk ended before all bytes were received.")
+        except OSError as err:
+            try:
+                with part_path.open("r+b") as output:
+                    output.truncate(current_size)
+            except OSError:
+                pass
+            raise AppError(f"Upload chunk could not be saved: {err}") from err
+
+        session["received"] = current_size + content_length
+        session["updated_at"] = now_iso()
+        write_upload_session(session)
+        return public_upload_session(session)
+
+
+def complete_upload_session(upload_id: str) -> dict[str, Any]:
+    ensure_no_conflicting_job("upload")
+    with UPLOAD_LOCK:
+        session = read_upload_session(upload_id)
+        part_path, metadata_path = upload_session_paths(upload_id)
+        received = part_path.stat().st_size
+        total_size = int(session.get("size") or 0)
+        if received != total_size:
+            raise AppError(
+                "Upload is not complete.",
+                HTTPStatus.CONFLICT,
+                {"received": received, "size": total_size},
+            )
+        job = start_job(
+            "upload",
+            "Upload analysieren",
+            job_cache_uploaded_file,
+            part_path,
+            str(session["filename"]),
+        )
+        try:
+            metadata_path.unlink()
+        except OSError:
+            pass
+        return job
+
+
+def cancel_upload_session(upload_id: str) -> dict[str, Any]:
+    with UPLOAD_LOCK:
+        part_path, metadata_path = upload_session_paths(upload_id)
+        existed = part_path.exists() or metadata_path.exists()
+        for path in (part_path, metadata_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as err:
+                raise AppError(f"Upload session could not be removed: {err}") from err
+    return {"id": normalized_upload_id(upload_id), "deleted": existed}
+
+
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "BackupDbRestore/0.5.11"
+    server_version = "BackupDbRestore/0.5.13"
 
     def do_GET(self) -> None:
         try:
@@ -5193,10 +5506,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_json(app_status())
             elif path == "/api/settings":
                 self.send_json(settings_status())
+            elif path.startswith("/api/uploads/"):
+                self.send_json(public_upload_session(read_upload_session(path.rsplit("/", 1)[-1])))
             elif path == "/api/source/entities":
                 self.send_json(paginated_source_entities(query))
             elif path == "/api/current/entities":
-                if any(name in query for name in ("offset", "limit", "filter")):
+                if any(name in query for name in ("offset", "limit", "filter", "type", "sort", "order")):
                     self.send_json(paginated_current_entities(query))
                 else:
                     self.send_json(list_current_entities())
@@ -5261,6 +5576,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             if path == "/api/config-backups/upload":
                 self.handle_config_backup_upload()
                 return
+            if path.startswith("/api/uploads/"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 3:
+                    raise AppError("Upload session was not found.", HTTPStatus.NOT_FOUND)
+                self.handle_upload_chunk(parts[2])
+                return
             if path != "/api/upload":
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
@@ -5278,6 +5599,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             if path == "/api/import":
                 ensure_no_conflicting_job("import")
                 self.send_json(import_history(self.read_json()))
+            elif path == "/api/uploads":
+                self.send_json(create_upload_session(self.read_json()), status=HTTPStatus.CREATED)
+            elif path.startswith("/api/uploads/") and path.endswith("/complete"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 4:
+                    raise AppError("Upload session was not found.", HTTPStatus.NOT_FOUND)
+                self.send_json(complete_upload_session(parts[2]), status=HTTPStatus.ACCEPTED)
             elif path == "/api/import/preview":
                 ensure_no_conflicting_job("import")
                 self.send_json(preflight_import(self.read_json()))
@@ -5330,6 +5658,36 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.log_error("Unhandled POST error: %s", err)
             self.send_json({"error": str(err)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
+    def do_DELETE(self) -> None:
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            if path.startswith("/api/uploads/"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 3:
+                    raise AppError("Upload session was not found.", HTTPStatus.NOT_FOUND)
+                self.send_json(cancel_upload_session(parts[2]))
+            elif path.startswith("/api/current-db-backups/"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 3:
+                    raise AppError("Current DB backup was not found.", HTTPStatus.NOT_FOUND)
+                ensure_no_conflicting_job("restore_current_db")
+                self.send_json(delete_current_db_backup(urllib.parse.unquote(parts[2])))
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+        except AppError as err:
+            self.send_json(app_error_payload(err), status=err.status)
+        except Exception as err:
+            self.log_error("Unhandled DELETE error: %s", err)
+            self.send_json({"error": str(err)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def handle_upload_chunk(self, upload_id: str) -> None:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            expected_offset = int(self.headers.get("X-Upload-Offset", "-1"))
+        except ValueError as err:
+            raise AppError("Upload chunk headers are invalid.") from err
+        self.send_json(append_upload_chunk(upload_id, expected_offset, content_length, self.rfile))
+
     def handle_upload(self, async_mode: bool = False) -> None:
         ensure_no_conflicting_job("upload")
         options = read_options()
@@ -5344,30 +5702,32 @@ class RequestHandler(BaseHTTPRequestHandler):
         original_name = Path(original_name).name or "upload"
         upload_path = UPLOAD_DIR / f"upload_{int(time.time())}_{original_name}"
 
-        remaining = content_length
-        with upload_path.open("wb") as output:
-            while remaining > 0:
-                chunk = self.rfile.read(min(1024 * 1024, remaining))
-                if not chunk:
-                    break
-                output.write(chunk)
-                remaining -= len(chunk)
-        if remaining:
-            raise AppError("Upload ended before all bytes were received.")
-
-        if async_mode:
-            self.send_json(
-                start_job("upload", "Upload analysieren", job_cache_uploaded_file, upload_path, original_name),
-                status=HTTPStatus.ACCEPTED,
-            )
-            return
-
-        result = handle_uploaded_file(upload_path, original_name)
+        owned_by_job = False
         try:
-            upload_path.unlink()
-        except OSError:
-            pass
-        self.send_json(result)
+            remaining = content_length
+            with upload_path.open("wb") as output:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            if remaining:
+                raise AppError("Upload ended before all bytes were received.")
+
+            if async_mode:
+                job = start_job("upload", "Upload analysieren", job_cache_uploaded_file, upload_path, original_name)
+                owned_by_job = True
+                self.send_json(job, status=HTTPStatus.ACCEPTED)
+                return
+
+            self.send_json(handle_uploaded_file(upload_path, original_name))
+        finally:
+            if not owned_by_job:
+                try:
+                    upload_path.unlink()
+                except OSError:
+                    pass
 
     def handle_config_backup_upload(self) -> None:
         options = read_options()
