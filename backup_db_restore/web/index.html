@@ -9,23 +9,47 @@
   <body>
     <main class="app-shell">
       <header class="topbar">
-        <div>
-          <h1>Backup DB Restore</h1>
-          <p id="currentDbPath"></p>
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <ellipse cx="12" cy="5" rx="7" ry="3"></ellipse>
+            <path d="M5 5v7c0 1.7 3.1 3 7 3s7-1.3 7-3V5"></path>
+            <path d="M5 12v7c0 1.7 3.1 3 7 3s7-1.3 7-3v-7"></path>
+          </svg>
         </div>
-        <div id="healthBadge" class="badge badge-muted">Pruefung laedt</div>
+        <div class="brand-copy">
+          <span class="eyebrow">Home Assistant App</span>
+          <h1>Backup DB Restore</h1>
+          <p id="currentDbPath">Recorder-Datenbank wird geprüft</p>
+        </div>
+        <div id="healthBadge" class="badge badge-muted">Prüfung läuft</div>
       </header>
 
       <nav class="tabbar" aria-label="Arbeitsbereich">
-        <button id="analysisTabButton" class="tab-button active" type="button" role="tab" aria-selected="true" aria-controls="analysisPage">Aktuelle DB-Analyse</button>
-        <button id="importTabButton" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="importPage">Backup & Import</button>
-        <button id="configBackupTabButton" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="configBackupPage">Konfig-Backup</button>
-        <button id="settingsTabButton" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="settingsPage">Einstellungen</button>
+        <span class="nav-label">Arbeitsbereich</span>
+        <button id="analysisTabButton" class="tab-button active" type="button" role="tab" aria-selected="true" aria-controls="analysisPage">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9m6 10V5m6 14v-7m4 7H2"></path></svg>
+          <span><strong>DB-Analyse</strong><small>Zustand und Wartung</small></span>
+        </button>
+        <button id="importTabButton" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="importPage">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4"></path><path d="M5 15v4h14v-4"></path></svg>
+          <span><strong>Backup & Import</strong><small>Historie wiederherstellen</small></span>
+        </button>
+        <button id="configBackupTabButton" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="configBackupPage">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v14H4zM8 3h8v3H8z"></path><path d="M9 11h6m-6 4h4"></path></svg>
+          <span><strong>Konfig-Backup</strong><small>Konfiguration sichern</small></span>
+        </button>
+        <button id="settingsTabButton" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="settingsPage">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M19 13.5v-3l-2-.7-.7-1.7.9-1.9-2.1-2.1-1.9.9-1.7-.7L10.5 2h-3l-.7 2-1.7.7-1.9-.9-2.1 2.1.9 1.9-.7 1.7L0 10.5v3l2 .7.7 1.7-.9 1.9 2.1 2.1 1.9-.9 1.7.7.7 2.3h3l.7-2 1.7-.7 1.9.9 2.1-2.1-.9-1.9.7-1.7z" transform="translate(2.25 0) scale(.82)"></path></svg>
+          <span><strong>Einstellungen</strong><small>Pfade und Optionen</small></span>
+        </button>
       </nav>
 
       <section class="progress-panel" aria-label="Fortschritt">
         <div class="progress-header">
-          <h2>Fortschritt</h2>
+          <div>
+            <span class="eyebrow">Aktivität</span>
+            <h2>Fortschritt</h2>
+          </div>
           <div class="progress-actions">
             <span id="progressStatus">Bereit</span>
             <button id="cancelJobButton" class="secondary small" type="button" hidden>Abbrechen</button>
@@ -34,10 +58,20 @@
         <div id="progressTrack" class="progress-track">
           <div id="progressBar" class="progress-bar"></div>
         </div>
-        <pre id="operationLog" class="operation-log" aria-live="polite"></pre>
+        <details class="log-disclosure">
+          <summary>Protokoll anzeigen</summary>
+          <pre id="operationLog" class="operation-log" aria-live="polite"></pre>
+        </details>
       </section>
 
       <section id="analysisPage" class="tab-page active" role="tabpanel" aria-labelledby="analysisTabButton">
+        <header class="page-heading">
+          <div>
+            <span class="eyebrow">Recorder-Datenbank</span>
+            <h2>Zustand und Wartung</h2>
+            <p>Gesundheit prüfen, Speicherverbrauch verstehen und Sicherungen verwalten.</p>
+          </div>
+        </header>
         <section class="status-grid" aria-label="Aktuelle Datenbank">
           <article class="status-box">
             <span class="status-label">Aktuelle DB</span>
@@ -215,18 +249,35 @@
       </section>
 
       <section id="importPage" class="tab-page" role="tabpanel" aria-labelledby="importTabButton" hidden>
-        <section class="toolbar" aria-label="Upload">
+        <header class="page-heading">
+          <div>
+            <span class="eyebrow">Datenwiederherstellung</span>
+            <h2>Backup analysieren und importieren</h2>
+            <p>Eine Quelle laden, passende Entitäten zuordnen und den Import vorab prüfen.</p>
+          </div>
+        </header>
+
+        <section class="source-grid" aria-label="Datenquelle auswählen">
+        <section class="toolbar source-card" aria-label="Upload">
+          <div class="source-card-heading">
+            <span class="step-badge">1</span>
+            <div><h2>Datei hochladen</h2><p>SQLite-Datenbank oder Home-Assistant-Backup</p></div>
+          </div>
           <label class="file-picker">
             <input id="fileInput" type="file" accept=".db,.sqlite,.sqlite3,.tar,.tar.gz,.tgz,.gz,.backup">
-            <span>Datei waehlen</span>
+            <span>Datei wählen</span>
           </label>
           <button id="uploadButton" type="button">Analysieren</button>
           <button id="cacheButton" type="button">Zwischenspeichern</button>
           <button id="clearCacheButton" class="secondary" type="button">Cache leeren</button>
-          <span id="uploadFileInfo" class="muted-line">Keine Datei ausgewaehlt</span>
+          <span id="uploadFileInfo" class="muted-line">Keine Datei ausgewählt</span>
         </section>
 
-        <section class="toolbar device-backups" aria-label="Gespeicherte Backups">
+        <section class="toolbar device-backups source-card" aria-label="Gespeicherte Backups">
+          <div class="source-card-heading">
+            <span class="step-badge">2</span>
+            <div><h2>Gespeichertes Backup</h2><p>Vorhandene Sicherung vom Gerät verwenden</p></div>
+          </div>
           <input id="backupFilter" type="search" placeholder="Backups filtern">
           <select id="deviceBackupSelect" aria-label="Gespeichertes Backup"></select>
           <button id="loadBackupButton" type="button">Aus Backup lesen</button>
@@ -234,6 +285,7 @@
           <span id="backupListInfo"></span>
           <button id="prevBackupPageButton" class="secondary small" type="button">Zurueck</button>
           <button id="nextBackupPageButton" class="secondary small" type="button">Weiter</button>
+        </section>
         </section>
 
         <section class="panel compact-panel recovery-panel" aria-label="Defekte Datenbanken">
@@ -369,6 +421,13 @@
       </section>
 
       <section id="configBackupPage" class="tab-page" role="tabpanel" aria-labelledby="configBackupTabButton" hidden>
+        <header class="page-heading">
+          <div>
+            <span class="eyebrow">Konfiguration</span>
+            <h2>Selektiv sichern und wiederherstellen</h2>
+            <p>Automationen, Dashboards und weitere Bereiche gezielt archivieren.</p>
+          </div>
+        </header>
         <section class="status-grid" aria-label="Konfigurationsbackup Status">
           <article class="status-box">
             <span class="status-label">Konfig-Backup-Ziel</span>
@@ -439,6 +498,13 @@
       </section>
 
       <section id="settingsPage" class="tab-page" role="tabpanel" aria-labelledby="settingsTabButton" hidden>
+        <header class="page-heading">
+          <div>
+            <span class="eyebrow">System</span>
+            <h2>Allgemeine Einstellungen</h2>
+            <p>Speicherorte, Upload-Limit und Laufzeitverhalten der App konfigurieren.</p>
+          </div>
+        </header>
         <section class="status-grid" aria-label="Einstellungen Status">
           <article class="status-box">
             <span class="status-label">Cache-Speicher</span>

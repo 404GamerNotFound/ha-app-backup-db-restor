@@ -30,7 +30,7 @@ DATA_DIR = Path(os.environ.get("BACKUP_DB_RESTORE_DATA_DIR", "/data"))
 BACKUP_DIR = Path(os.environ.get("BACKUP_DB_RESTORE_BACKUP_DIR", "/backup"))
 CONFIG_DIR = Path(os.environ.get("BACKUP_DB_RESTORE_CONFIG_DIR", "/homeassistant_config"))
 OPTIONS_PATH = DATA_DIR / "options.json"
-APP_VERSION = "0.5.13"
+APP_VERSION = "0.5.14"
 VALID_LOG_LEVELS = {"trace", "debug", "info", "notice", "warning", "error", "fatal"}
 DEFAULT_OPTIONS = {
     "log_level": "info",
@@ -5487,7 +5487,7 @@ def cancel_upload_session(upload_id: str) -> dict[str, Any]:
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "BackupDbRestore/0.5.13"
+    server_version = "BackupDbRestore/0.5.14"
 
     def do_GET(self) -> None:
         try:

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.14
+
+- Ingress-Oberflaeche grundlegend neu gestaltet. Auf breiten Ansichten trennt
+  eine feste Seitennavigation die Arbeitsbereiche DB-Analyse, Backup-Import,
+  Konfig-Backup und Einstellungen; auf schmalen Ansichten wird sie automatisch
+  als kompakte, zweizeilige Tab-Leiste dargestellt.
+- Visuelle Hierarchie ueberarbeitet: neue Bereichsueberschriften, Statuskarten,
+  Quellenauswahl-Karten und konsistente Primaer-, Sekundaer- und
+  Gefahrenaktionen machen Status, Wartung und destruktive Operationen schneller
+  unterscheidbar.
+- Responsives Layout fuer Home-Assistant-Ingress optimiert. Formulare,
+  Werkzeugleisten, Tabellen, Importbereich und Purge-Steuerung passen sich an
+  Desktop-, Tablet- und Mobilbreiten an, ohne horizontales Seiten-Overflow zu
+  erzeugen.
+- Helles und dunkles Farbschema auf gemeinsame CSS-Design-Tokens umgestellt.
+  Kontraste, Fokusmarkierungen, Hover-Zustaende und reduzierte Animationen bei
+  aktivierter Betriebssystemoption `prefers-reduced-motion` wurden ergaenzt.
+- Fortschrittsanzeige komprimiert und das ausfuehrliche Job-Protokoll in einen
+  aufklappbaren Bereich verschoben, damit der aktuelle Arbeitsbereich im Fokus
+  bleibt.
+- Tab-Bedienung fuer Tastaturen vervollstaendigt. Pfeiltasten sowie `Home` und
+  `End` wechseln den aktiven Arbeitsbereich und aktualisieren ARIA-Auswahl und
+  Fokus, ohne die bestehenden URL-Hashes oder API-Vertraege zu veraendern.
+
 ## 0.5.13
 
 - Grosse Recorder-Datenbanken werden nicht mehr als einzelner, lang laufender

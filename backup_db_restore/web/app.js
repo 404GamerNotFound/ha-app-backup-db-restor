@@ -50,6 +50,12 @@ const state = {
 
 const ACTIVE_JOB_STATUSES = ["queued", "running", "cancelling"];
 const CANCELLABLE_JOB_KINDS = ["upload", "load_backup", "load_corrupt_database", "refresh_cache", "import", "config_backup", "restore_config_backup"];
+const TAB_DEFINITIONS = {
+  analysis: { page: "analysisPage", button: "analysisTabButton", hash: "#analyse" },
+  import: { page: "importPage", button: "importTabButton", hash: "#import" },
+  config: { page: "configBackupPage", button: "configBackupTabButton", hash: "#konfig-backup" },
+  settings: { page: "settingsPage", button: "settingsTabButton", hash: "#einstellungen" },
+};
 
 const $ = (id) => document.getElementById(id);
 
@@ -111,23 +117,36 @@ function setActiveTab(tabName, updateHash = true) {
   const activeTab = ["import", "config", "settings"].includes(tabName) ? tabName : "analysis";
   state.activeTab = activeTab;
 
-  const tabs = {
-    analysis: { page: "analysisPage", button: "analysisTabButton", hash: "#analyse" },
-    import: { page: "importPage", button: "importTabButton", hash: "#import" },
-    config: { page: "configBackupPage", button: "configBackupTabButton", hash: "#konfig-backup" },
-    settings: { page: "settingsPage", button: "settingsTabButton", hash: "#einstellungen" },
-  };
-  for (const [name, item] of Object.entries(tabs)) {
+  for (const [name, item] of Object.entries(TAB_DEFINITIONS)) {
     const isActive = name === activeTab;
     $(item.page).hidden = !isActive;
     $(item.page).classList.toggle("active", isActive);
     $(item.button).classList.toggle("active", isActive);
     $(item.button).setAttribute("aria-selected", String(isActive));
+    $(item.button).tabIndex = isActive ? 0 : -1;
   }
 
   if (updateHash) {
-    window.history.replaceState(null, "", tabs[activeTab].hash);
+    window.history.replaceState(null, "", TAB_DEFINITIONS[activeTab].hash);
   }
+}
+
+function handleTabKeydown(event) {
+  const tabNames = Object.keys(TAB_DEFINITIONS);
+  const currentIndex = tabNames.findIndex((name) => TAB_DEFINITIONS[name].button === event.currentTarget.id);
+  if (currentIndex < 0) return;
+
+  let nextIndex = currentIndex;
+  if (["ArrowRight", "ArrowDown"].includes(event.key)) nextIndex = (currentIndex + 1) % tabNames.length;
+  else if (["ArrowLeft", "ArrowUp"].includes(event.key)) nextIndex = (currentIndex - 1 + tabNames.length) % tabNames.length;
+  else if (event.key === "Home") nextIndex = 0;
+  else if (event.key === "End") nextIndex = tabNames.length - 1;
+  else return;
+
+  event.preventDefault();
+  const nextTab = tabNames[nextIndex];
+  setActiveTab(nextTab);
+  $(TAB_DEFINITIONS[nextTab].button).focus();
 }
 
 function setBusy(isBusy) {
@@ -1988,6 +2007,9 @@ async function restoreConfigBackup() {
 }
 
 function bindEvents() {
+  for (const item of Object.values(TAB_DEFINITIONS)) {
+    $(item.button).addEventListener("keydown", handleTabKeydown);
+  }
   $("analysisTabButton").addEventListener("click", () => setActiveTab("analysis"));
   $("importTabButton").addEventListener("click", () => setActiveTab("import"));
   $("configBackupTabButton").addEventListener("click", () => setActiveTab("config"));
